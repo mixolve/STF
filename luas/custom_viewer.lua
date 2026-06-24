@@ -1,9 +1,9 @@
 local SCRIPT_NAME = "LR Spectrum Viewer"
 local GMEM_NAME = "ITEM_LR_DELTA_8K"
 
-local FONT_NAME = "Sometype Mono"
-local FONT_SIZE = 15
-local UI_FONT_SIZE = 15
+local FONT_NAME = "Fira Code"
+local FONT_SIZE = 16
+local UI_FONT_SIZE = 16
 
 local ctx = reaper.ImGui_CreateContext(SCRIPT_NAME)
 local font_ui = reaper.ImGui_CreateFont(FONT_NAME, UI_FONT_SIZE)
@@ -21,7 +21,7 @@ local show_side = false
 
 local active_tab = 0
 
-local SLOPE_DB_PER_OCT = 5.0
+local SLOPE_DB_PER_OCT = 4.5
 local SLOPE_REF_FREQ = 632.0
 local SLOPE_ENABLED = true
 local slope_values = {5.0, 4.5, 4.0}
