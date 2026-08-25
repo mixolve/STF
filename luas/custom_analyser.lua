@@ -4,9 +4,19 @@ local HOP = FFT_SIZE
 local FALLBACK_SR = 44100
 
 local EPS = 1e-12
+local PHASE_VALID_DB = -90.0
+local PHASE_VALID_REL = 10.0 ^ (PHASE_VALID_DB / 20.0)
+local PHASE_VALID_ABS = 1e-9
 local TAKE_MODE = 2
+local SPECTRUM_MODE_AVG = 0
+local SPECTRUM_MODE_MAX_PEAK = 1
 
 reaper.gmem_attach(GMEM_NAME)
+
+local spectrum_mode = math.floor(reaper.gmem_read(14) or SPECTRUM_MODE_AVG)
+if spectrum_mode ~= SPECTRUM_MODE_MAX_PEAK then
+  spectrum_mode = SPECTRUM_MODE_AVG
+end
 
 local function clear_payload()
   reaper.gmem_write(0, 0)
@@ -150,21 +160,28 @@ local end_t = reaper.GetAudioAccessorEndTime(accessor)
 local nbins = FFT_SIZE // 2 + 1
 
 local lmag, rmag = {}, {}
+local stmag = {}
 local mmag, smag = {}, {}
 local corr_spec = {}
+local corr_count = {}
 
 for i = 1, nbins do
   lmag[i] = 0.0
   rmag[i] = 0.0
+  stmag[i] = 0.0
   mmag[i] = 0.0
   smag[i] = 0.0
   corr_spec[i] = 0.0
+  corr_count[i] = 0
 end
 
 local win = {}
+local win_sum = 0.0
 for i = 1, FFT_SIZE do
   win[i] = 0.5 * (1.0 - math.cos((2.0 * math.pi * (i - 1)) / (FFT_SIZE - 1)))
+  win_sum = win_sum + win[i]
 end
+local magnitude_norm = win_sum > EPS and (2.0 / win_sum) or (1.0 / FFT_SIZE)
 
 local buf = reaper.new_array(FFT_SIZE * 2)
 local frames = 0
@@ -214,6 +231,21 @@ while (pos + fft_sec) <= end_t do
     fft(reL, imL)
     fft(reR, imR)
 
+    local frame_peak = 0.0
+    for k = 1, nbins do
+      local lre = reL[k]
+      local lim = imL[k]
+      local rre = reR[k]
+      local rim = imR[k]
+      local ml = math.sqrt(lre * lre + lim * lim)
+      local mr = math.sqrt(rre * rre + rim * rim)
+
+      if ml > frame_peak then frame_peak = ml end
+      if mr > frame_peak then frame_peak = mr end
+    end
+
+    local phase_floor = math.max(frame_peak * PHASE_VALID_REL, PHASE_VALID_ABS)
+
     for k = 1, nbins do
       local lre = reL[k]
       local lim = imL[k]
@@ -227,18 +259,30 @@ while (pos + fft_sec) <= end_t do
 
       local ml = math.sqrt(lre * lre + lim * lim)
       local mr = math.sqrt(rre * rre + rim * rim)
+      local mt = (ml + mr) * 0.5
       local mm = math.sqrt(mre * mre + mim * mim)
       local ms = math.sqrt(sre * sre + sim * sim)
 
-      lmag[k] = lmag[k] + ml
-      rmag[k] = rmag[k] + mr
-      mmag[k] = mmag[k] + mm
-      smag[k] = smag[k] + ms
+      if spectrum_mode == SPECTRUM_MODE_MAX_PEAK then
+        if ml > lmag[k] then lmag[k] = ml end
+        if mr > rmag[k] then rmag[k] = mr end
+        if mt > stmag[k] then stmag[k] = mt end
+        if mm > mmag[k] then mmag[k] = mm end
+        if ms > smag[k] then smag[k] = ms end
+      else
+        lmag[k] = lmag[k] + ml
+        rmag[k] = rmag[k] + mr
+        stmag[k] = stmag[k] + mt
+        mmag[k] = mmag[k] + mm
+        smag[k] = smag[k] + ms
+      end
 
-      local num = (lre * rre) + (lim * rim)
-      local den = (ml * mr) + EPS
-      local c = clamp(num / den, -1.0, 1.0)
-      corr_spec[k] = corr_spec[k] + c
+      if ml >= phase_floor and mr >= phase_floor then
+        local phase_l = math.atan(lim, lre)
+        local phase_r = math.atan(rim, rre)
+        corr_spec[k] = corr_spec[k] + math.cos(phase_l - phase_r)
+        corr_count[k] = corr_count[k] + 1
+      end
     end
 
     frames = frames + 1
@@ -256,11 +300,18 @@ if frames == 0 then
 end
 
 for k = 1, nbins do
-  lmag[k] = lmag[k] / frames
-  rmag[k] = rmag[k] / frames
-  mmag[k] = mmag[k] / frames
-  smag[k] = smag[k] / frames
-  corr_spec[k] = corr_spec[k] / frames
+  if spectrum_mode == SPECTRUM_MODE_AVG then
+    lmag[k] = lmag[k] / frames
+    rmag[k] = rmag[k] / frames
+    stmag[k] = stmag[k] / frames
+    mmag[k] = mmag[k] / frames
+    smag[k] = smag[k] / frames
+  end
+  if corr_count[k] > 0 then
+    corr_spec[k] = corr_spec[k] / corr_count[k]
+  else
+    corr_spec[k] = 1.0
+  end
 end
 
 local left_db = {}
@@ -270,14 +321,14 @@ local mid_db = {}
 local side_db = {}
 
 for k = 1, nbins do
-  local ldb = 20.0 * math.log(lmag[k] + EPS, 10)
-  local rdb = 20.0 * math.log(rmag[k] + EPS, 10)
-  local mdb = 20.0 * math.log(mmag[k] + EPS, 10)
-  local sdb = 20.0 * math.log(smag[k] + EPS, 10)
+  local ldb = 20.0 * math.log((lmag[k] * magnitude_norm) + EPS, 10)
+  local rdb = 20.0 * math.log((rmag[k] * magnitude_norm) + EPS, 10)
+  local mdb = 20.0 * math.log((mmag[k] * magnitude_norm) + EPS, 10)
+  local sdb = 20.0 * math.log((smag[k] * magnitude_norm) + EPS, 10)
 
   left_db[k] = ldb
   right_db[k] = rdb
-  stereo_db[k] = 20.0 * math.log(((lmag[k] + rmag[k]) * 0.5) + EPS, 10)
+  stereo_db[k] = 20.0 * math.log((stmag[k] * magnitude_norm) + EPS, 10)
   mid_db[k] = mdb
   side_db[k] = sdb
 end
