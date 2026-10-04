@@ -1,3 +1,23 @@
+function UppercaseFXText(text)
+    local value = tostring(text or ""):upper()
+    return (value:gsub("[\208-\212][\128-\191]", function(character)
+        local cp = utf8.codepoint(character)
+        if cp >= 0x0430 and cp <= 0x044F then
+            cp = cp - 32
+        elseif cp >= 0x0450 and cp <= 0x045F then
+            cp = cp - 80
+        elseif cp == 0x04CF then
+            cp = 0x04C0
+        elseif ((cp >= 0x0460 and cp <= 0x0481)
+            or (cp >= 0x048A and cp <= 0x04BF)
+            or (cp >= 0x04C1 and cp <= 0x04CE)
+            or (cp >= 0x04D0 and cp <= 0x052F)) and cp % 2 == 1 then
+            cp = cp - 1
+        end
+        return utf8.char(cp)
+    end))
+end
+
 --@noindex
 --NoIndex: true
 
@@ -364,10 +384,10 @@ function Filter_actions(filter_text, tbl)
         local search_name = type(item) == "table" and item.search or item
         local add_name = type(item) == "table" and item.name or item
         local display_name = type(item) == "table" and item.display or add_name
-        local name = search_name:lower()
+        local name = UppercaseFXText(search_name)
         local found = true
         for word in filter_text:gmatch("%S+") do
-            if not name:find(word:lower(), 1, true) then
+            if not name:find(UppercaseFXText(word), 1, true) then
                 found = false
                 break
             end

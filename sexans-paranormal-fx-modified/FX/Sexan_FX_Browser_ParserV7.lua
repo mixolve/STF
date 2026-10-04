@@ -642,6 +642,15 @@ local function NormalizePluginLookupName(name)
     return name:lower()
 end
 
+local function PluginLookupKeys(name)
+    local key = NormalizePluginLookupName(name)
+    if key == "" then return {} end
+
+    local compact_key = key:gsub("[^%w]", "")
+    if compact_key == key then return { key } end
+    return { key, compact_key }
+end
+
 local function PluginExtension(name)
     local lower_name = tostring(name or ""):lower()
     for i = 1, #AUDIO_PLUGIN_EXTS do
@@ -668,11 +677,11 @@ local function AddInstalledPluginLookup(lookup, fx_name, ident)
         kind = "ALL"
     end
 
-    local function add_key(key)
-        key = NormalizePluginLookupName(key)
-        if key == "" then return end
-        lookup.ALL[key] = lookup.ALL[key] or fx_name
-        lookup[kind][key] = lookup[kind][key] or fx_name
+    local function add_key(value)
+        for _, key in ipairs(PluginLookupKeys(value)) do
+            lookup.ALL[key] = lookup.ALL[key] or fx_name
+            lookup[kind][key] = lookup[kind][key] or fx_name
+        end
     end
 
     add_key(fx_name)
@@ -694,9 +703,12 @@ local function AddAudioPluginFolderItem(list, seen, lookup, item_name)
     local ext = PluginExtension(item_name)
     if not ext then return end
 
-    local key = NormalizePluginLookupName(item_name)
     local kind = PluginKindFromExtension(ext)
-    local fx_name = lookup[kind] and lookup[kind][key]
+    local fx_name
+    for _, key in ipairs(PluginLookupKeys(item_name)) do
+        fx_name = lookup[kind] and lookup[kind][key]
+        if fx_name then break end
+    end
     if fx_name and not seen[fx_name] then
         list[#list + 1] = fx_name
         seen[fx_name] = true

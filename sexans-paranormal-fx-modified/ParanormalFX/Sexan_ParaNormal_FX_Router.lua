@@ -128,33 +128,42 @@ dofile(r.GetResourcePath() .. '/Scripts/ReaTeam Extensions/API/imgui.lua')('0.8.
 
 ctx = ImGui.CreateContext('ParaNormalFX Router')
 
+local shortcut_state
+local function UpdateReaperShortcuts(focused, capture)
+    REAPER_SHORTCUT_BRIDGE = r.GetExtState("CustomWebBrowser", "paranormalShortcutBridge") == "1"
+    local state = (focused and "1" or "0") .. (capture and "1" or "0")
+    if state ~= shortcut_state then
+        r.SetExtState("CustomWebBrowser", "paranormalFocused", focused and "1" or "0", false)
+        r.SetExtState("CustomWebBrowser", "paranormalCapture", capture and "1" or "0", false)
+        shortcut_state = state
+    end
+    if REAPER_SHORTCUT_BRIDGE then ImGui.SetNextFrameWantCaptureKeyboard(ctx, capture) end
+end
+
 ImGui.SetConfigVar(ctx, ImGui.ConfigVar_WindowsMoveFromTitleBarOnly(), 1)
 WND_FLAGS = ImGui.WindowFlags_NoScrollbar() | ImGui.WindowFlags_NoScrollWithMouse()
 FLT_MIN, FLT_MAX = ImGui.NumericLimits_Float()
 
 draw_list = r.ImGui_GetWindowDrawList(ctx)
 
-ORG_FONT_SIZE = 13
+ORG_FONT_SIZE = 17
 FONT_SIZE = ORG_FONT_SIZE
+local TEXT_FONT_FILE = script_path .. 'Fonts/IosevkaCharonMono-Bold.ttf'
 
-ICONS_FONT_SMALL = ImGui.CreateFont(script_path .. 'Fonts/Icons.ttf', FONT_SIZE)
+TABLER_ICON = require("Modules/TablerIcons")
+ICON_FONT_SIZE = 18
+ICONS_FONT_SMALL = ImGui.CreateFont(script_path .. 'Fonts/TablerIcons-P0.ttf', ICON_FONT_SIZE)
 ImGui.Attach(ctx, ICONS_FONT_SMALL)
-ICONS_FONT_SMALL_FACTORY = ImGui.CreateFont(script_path .. 'Fonts/Icons.ttf', FONT_SIZE)
-ImGui.Attach(ctx, ICONS_FONT_SMALL_FACTORY)
-ICONS_FONT_LARGE = ImGui.CreateFont(script_path .. 'Fonts/Icons.ttf', 16)
-ImGui.Attach(ctx, ICONS_FONT_LARGE)
+ICONS_FONT_SMALL_FACTORY = ICONS_FONT_SMALL
+ICONS_FONT_LARGE = ICONS_FONT_SMALL
 
-SYSTEM_FONT = ImGui.CreateFont('sans-serif', FONT_SIZE, ImGui.FontFlags_Bold())
+SYSTEM_FONT = ImGui.CreateFont(TEXT_FONT_FILE, FONT_SIZE)
 ImGui.Attach(ctx, SYSTEM_FONT)
-DEFAULT_FONT = ImGui.CreateFont(script_path .. 'Fonts/ProggyClean.ttf', FONT_SIZE)
-ImGui.Attach(ctx, DEFAULT_FONT)
-
-DEFAULT_FONT_FACTORY = ImGui.CreateFont(script_path .. 'Fonts/ProggyClean.ttf', ORG_FONT_SIZE)
-ImGui.Attach(ctx, DEFAULT_FONT_FACTORY)
-SYSTEM_FONT_FACTORY = ImGui.CreateFont('sans-serif', FONT_SIZE, ImGui.FontFlags_Bold())
-ImGui.Attach(ctx, SYSTEM_FONT_FACTORY)
-TOOLBAR_TEXT_FONT = ImGui.CreateFont('sans-serif', FONT_SIZE + 1, ImGui.FontFlags_Bold())
-ImGui.Attach(ctx, TOOLBAR_TEXT_FONT)
+-- One font instance for widgets, menus and custom draw-list labels.
+DEFAULT_FONT = SYSTEM_FONT
+DEFAULT_FONT_FACTORY = SYSTEM_FONT
+SYSTEM_FONT_FACTORY = SYSTEM_FONT
+TOOLBAR_TEXT_FONT = SYSTEM_FONT
 
 DEF_PARALLEL            = "2"
 ESC_CLOSE               = false
@@ -194,6 +203,7 @@ if r.file_exists(fm_script_path) then
     dofile(fm_script_path)
 end
 
+require("Modules/TextLayout")
 require("Modules/Utils")
 require("Modules/Drawing")
 require("Modules/Canvas")
@@ -242,7 +252,7 @@ if r.HasExtState("PARANORMALFX2", "SETTINGS") then
             WireThickness = storedTable.wirethickness
             COLOR["wire"] = storedTable.wire_color
             COLOR["n"] = storedTable.fx_color
-            if COLOR["n"] == 0x9999FFFF then COLOR["n"] = 0x99CC99FF end
+            if COLOR["n"] == 0x9999FFFF then COLOR["n"] = 0xBBBBBBFF end
             COLOR["bypass"] = storedTable.bypass_color
             COLOR["Container"] = storedTable.container_color
             COLOR["parallel"] = storedTable.parallel_color
@@ -382,7 +392,7 @@ UpdateChainsTrackTemplates(CAT)
 
 function UpdateZoomFont()
     if not CANVAS then return end
-    local new_font_size = (ORG_FONT_SIZE * CANVAS.scale) // 1
+    local new_font_size = ORG_FONT_SIZE
     if FONT_SIZE ~= new_font_size then
         if NEXT_FRAME then
             if DEFAULT_FONT then
@@ -390,11 +400,11 @@ function UpdateZoomFont()
                 r.ImGui_Detach(ctx, SYSTEM_FONT)
                 r.ImGui_Detach(ctx, DEFAULT_FONT)
             end
-            ICONS_FONT_SMALL = ImGui.CreateFont(script_path .. 'Fonts/Icons.ttf', new_font_size)
+            ICONS_FONT_SMALL = ImGui.CreateFont(script_path .. 'Fonts/TablerIcons-P0.ttf', ICON_FONT_SIZE)
             ImGui.Attach(ctx, ICONS_FONT_SMALL)
-            SYSTEM_FONT = ImGui.CreateFont('sans-serif', new_font_size, ImGui.FontFlags_Bold())
+            SYSTEM_FONT = ImGui.CreateFont(TEXT_FONT_FILE, new_font_size)
             ImGui.Attach(ctx, SYSTEM_FONT)
-            DEFAULT_FONT = ImGui.CreateFont(script_path .. 'Fonts/ProggyClean.ttf', new_font_size)
+            DEFAULT_FONT = ImGui.CreateFont(TEXT_FONT_FILE, new_font_size)
             ImGui.Attach(ctx, DEFAULT_FONT)
             FONT_SIZE = new_font_size
             SELECTED_FONT = CUSTOM_FONT and SYSTEM_FONT or DEFAULT_FONT
@@ -422,6 +432,95 @@ local function UpdateDeltaTime()
     FLUX.update(DT)
 end
 
+function DrawPopupRowBackground(context, colour, y1, y2)
+    local list = r.ImGui_GetWindowDrawList(context)
+    local wx, wy = r.ImGui_GetWindowPos(context)
+    local ww, wh = r.ImGui_GetWindowSize(context)
+    local cx = r.ImGui_GetCursorScreenPos(context)
+    local available_w = r.ImGui_GetContentRegionAvail(context)
+    local right = math.min(wx + ww - 1, cx + available_w + PARANORMAL_TEXT_PADDING + PARANORMAL_BORDER_WIDTH)
+    r.ImGui_DrawList_PushClipRect(list, wx + 1, wy + 1, right, wy + wh - 1, false)
+    r.ImGui_DrawList_AddRectFilled(list, wx + 1, y1, right, y2, r.ImGui_GetColorEx(context, colour))
+    r.ImGui_DrawList_PopClipRect(list)
+end
+
+local menu_item_rects = {}
+local menu_open_state = {}
+local function MenuRowHovered(key)
+    local rect = menu_item_rects[key]
+    local mx, my = r.ImGui_GetMousePos(ctx)
+    return rect and mx >= rect[1] and mx <= rect[3] and my >= rect[2] and my <= rect[4]
+end
+local function RememberMenuRow(key)
+    local x1, y1 = r.ImGui_GetItemRectMin(ctx)
+    local x2, y2 = r.ImGui_GetItemRectMax(ctx)
+    menu_item_rects[key] = {x1, y1, x2, y2}
+end
+function MonoMenuItem(context, label, shortcut, selected, enabled)
+    local wx, wy = r.ImGui_GetWindowPos(context)
+    local key = tostring(wx) .. ":" .. tostring(wy) .. ":" .. label
+    local highlighted = enabled ~= false and MenuRowHovered(key)
+    r.ImGui_PushStyleColor(context, r.ImGui_Col_Text(), 0xFFFFFF00)
+    local _, row_y = r.ImGui_GetCursorScreenPos(context)
+    local _, spacing_y = r.ImGui_GetStyleVar(context, r.ImGui_StyleVar_ItemSpacing())
+    if highlighted then
+        DrawPopupRowBackground(context, 0xBBBBBBFF, row_y - spacing_y / 2,
+            row_y + r.ImGui_GetTextLineHeight(context) + spacing_y / 2)
+    end
+    local clicked, checked = r.ImGui_MenuItem(context, label, shortcut, selected, enabled)
+    r.ImGui_PopStyleColor(context)
+    RememberMenuRow(key)
+    local ww = r.ImGui_GetWindowSize(context)
+    ParaDrawText(r.ImGui_GetWindowDrawList(context), label, wx, row_y-spacing_y/2,
+        wx+ww-1,row_y+r.ImGui_GetTextLineHeight(context)+spacing_y/2-1,
+        enabled == false and 0xBBBBBBFF or highlighted and 0x000000FF or 0xFFFFFFFF,0,false,1)
+    return clicked, checked
+end
+local menu_label_stack = {}
+local function DrawMonoMenuLabel(entry)
+    if entry.highlighted then
+        r.ImGui_DrawList_PushClipRect(entry.list, entry.wx + 1, entry.wy + 1,
+            entry.wx + entry.ww - 1, entry.wy + entry.wh - 1, false)
+        r.ImGui_DrawList_AddRectFilled(entry.list, entry.wx + 1, entry.y - 4,
+            entry.wx + entry.ww - 1, entry.y + entry.font_h + 4, 0xBBBBBBFF)
+        r.ImGui_DrawList_PopClipRect(entry.list)
+    end
+    ParaDrawText(entry.list, entry.label, entry.wx, entry.y - PARANORMAL_TEXT_PADDING,
+        entry.wx + entry.ww - 1, entry.y + entry.font_h + PARANORMAL_TEXT_PADDING - 1,
+        entry.colour, 0, false, 1)
+end
+function BeginMonoMenu(context, label, enabled)
+    local wx, wy = r.ImGui_GetWindowPos(context)
+    local ww, wh = r.ImGui_GetWindowSize(context)
+    local key = tostring(wx) .. ":" .. tostring(wy) .. ":" .. label
+    local list = r.ImGui_GetWindowDrawList(context)
+    local x, y = r.ImGui_GetCursorScreenPos(context)
+    local font_h = r.ImGui_GetTextLineHeight(context)
+    local mx, my = r.ImGui_GetMousePos(context)
+    local hovered = enabled ~= false and mx >= wx and mx < wx + ww
+        and my >= y - 4 and my < y + font_h + 4
+    -- Native arrows use Text; make that pass invisible and draw only the label.
+    r.ImGui_PushStyleColor(context, r.ImGui_Col_Text(), 0xFFFFFF00)
+    r.ImGui_PushStyleColor(context, r.ImGui_Col_TextDisabled(), 0xFFFFFF00)
+    local _, inner_y = r.ImGui_GetStyleVar(context, r.ImGui_StyleVar_ItemInnerSpacing())
+    -- ImGui uses this value as submenu overlap; negative overlap creates an 8px gap.
+    r.ImGui_PushStyleVar(context, r.ImGui_StyleVar_ItemInnerSpacing(), -8, inner_y)
+    r.ImGui_PushStyleVar(context, r.ImGui_StyleVar_WindowPadding(), PARANORMAL_TEXT_PADDING + PARANORMAL_BORDER_WIDTH, PARANORMAL_TEXT_PADDING)
+    local open = r.ImGui_BeginMenu(context, label, enabled)
+    r.ImGui_PopStyleVar(context, 2)
+    r.ImGui_PopStyleColor(context, 2)
+    local entry = {list = list, x = x, y = y, wx = wx, wy = wy, ww = ww, wh = wh, font_h = font_h, highlighted = hovered or open, label = (label:gsub("##.*$", "")),
+        colour = enabled == false and 0xBBBBBBFF or (hovered or open) and 0x000000FF or 0xFFFFFFFF}
+    if open then menu_label_stack[#menu_label_stack + 1] = entry
+    else DrawMonoMenuLabel(entry) end
+    return open
+end
+function EndMonoMenu(context)
+    r.ImGui_EndMenu(context)
+    local entry = table.remove(menu_label_stack)
+    if entry then DrawMonoMenuLabel(entry) end
+end
+
 local function PushPaletteStyle()
     local colors = GetColorTbl()
     local count = 0
@@ -433,26 +532,26 @@ local function PushPaletteStyle()
     end
 
     push(r.ImGui_Col_WindowBg, colors["bg"])
-    push(r.ImGui_Col_PopupBg, 0x333333FF)
-    push(r.ImGui_Col_TitleBg, 0x333333FF)
+    push(r.ImGui_Col_PopupBg, 0x222222FF)
+    push(r.ImGui_Col_TitleBg, 0x222222FF)
     push(r.ImGui_Col_TitleBgActive, 0x666666FF)
-    push(r.ImGui_Col_TitleBgCollapsed, 0x333333FF)
-    push(r.ImGui_Col_Border, 0x666666FF)
+    push(r.ImGui_Col_TitleBgCollapsed, 0x222222FF)
+    push(r.ImGui_Col_Border, 0xBBBBBBFF)
     push(r.ImGui_Col_Separator, 0x666666FF)
     push(r.ImGui_Col_Text, 0xFFFFFFFF)
     push(r.ImGui_Col_TextDisabled, 0x666666FF)
     push(r.ImGui_Col_TextSelectedBg, 0x666666FF)
-    push(r.ImGui_Col_FrameBg, 0x333333FF)
-    push(r.ImGui_Col_FrameBgHovered, 0x333333FF)
+    push(r.ImGui_Col_FrameBg, 0x222222FF)
+    push(r.ImGui_Col_FrameBgHovered, 0x222222FF)
     push(r.ImGui_Col_FrameBgActive, 0x9999FFFF)
-    push(r.ImGui_Col_CheckMark, 0x99CC99FF)
-    push(r.ImGui_Col_Button, 0x333333FF)
-    push(r.ImGui_Col_ButtonHovered, 0x333333FF)
-    push(r.ImGui_Col_ButtonActive, 0x9999FFFF)
-    push(r.ImGui_Col_Header, 0x666666FF)
-    push(r.ImGui_Col_HeaderHovered, 0x666666FF)
-    push(r.ImGui_Col_HeaderActive, 0x99CCCCFF)
-    push(r.ImGui_Col_ScrollbarBg, 0x333333FF)
+    push(r.ImGui_Col_CheckMark, 0xBBBBBBFF)
+    push(r.ImGui_Col_Button, 0x222222FF)
+    push(r.ImGui_Col_ButtonHovered, 0x222222FF)
+    push(r.ImGui_Col_ButtonActive, 0x222222FF)
+    push(r.ImGui_Col_Header, 0xBBBBBBFF)
+    push(r.ImGui_Col_HeaderHovered, 0xBBBBBBFF)
+    push(r.ImGui_Col_HeaderActive, 0xBBBBBBFF)
+    push(r.ImGui_Col_ScrollbarBg, 0x222222FF)
     push(r.ImGui_Col_ScrollbarGrab, 0x666666FF)
     push(r.ImGui_Col_ScrollbarGrabHovered, 0x666666FF)
     push(r.ImGui_Col_ScrollbarGrabActive, 0xCCCCCCFF)
@@ -463,22 +562,48 @@ local function PushPaletteStyle()
     return count
 end
 
+TOOLBAR_BUTTON_HEIGHT = PARANORMAL_ROW_HEIGHT
+PARANORMAL_SPACING = 8
+
+function GetToolbarButtonWidth(label)
+    return ParaPaddedWidth(label)
+end
+
+local mode_button_draws = {}
+local function PaintToolbarButton(button, selected)
+    ParaDrawFrame(button.list,button.x1,button.y1,button.x2,button.y2,
+        selected and 0xBBBBBBFF or 0x444444FF,0xBBBBBBFF)
+    ParaDrawText(button.list,button.label,button.x1,button.y1,button.x2,button.y2,
+        selected and 0x000000FF or 0xFFFFFFFF,0.5,false,1)
+end
+
+function DrawToolbarButton(label, id, active)
+    local width = GetToolbarButtonWidth(label)
+    local clicked = r.ImGui_InvisibleButton(ctx, "##" .. id, width, TOOLBAR_BUTTON_HEIGHT)
+    local x1,y1 = r.ImGui_GetItemRectMin(ctx)
+    local x2,y2 = r.ImGui_GetItemRectMax(ctx)
+    local button = {label=label,x1=x1,y1=y1,x2=x2,y2=y2,list=r.ImGui_GetWindowDrawList(ctx),
+        held=r.ImGui_IsItemActive(ctx)}
+    if id:match("^MODE_") then
+        mode_button_draws[#mode_button_draws+1] = button
+    else
+        local selected
+        if id == "settings" and clicked then selected = not active
+        else selected = active or button.held or clicked end
+        PaintToolbarButton(button, selected)
+    end
+    return clicked
+end
+
+local function PaintModeButtons()
+    for _,button in ipairs(mode_button_draws) do
+        PaintToolbarButton(button, button.label == MODE or button.held)
+    end
+    mode_button_draws = {}
+end
+
 local function ModeButton(label, active)
-    local x, y = r.ImGui_GetCursorScreenPos(ctx)
-    local text_w, text_h = r.ImGui_CalcTextSize(ctx, label)
-    local line_h = r.ImGui_GetTextLineHeight(ctx)
-    r.ImGui_InvisibleButton(ctx, "##MODE_" .. label, text_w, line_h)
-    local color = active and 0x99CC99FF or 0xFFFFFFFF
-    r.ImGui_DrawList_AddTextEx(
-        r.ImGui_GetWindowDrawList(ctx),
-        nil,
-        r.ImGui_GetFontSize(ctx),
-        x,
-        y + (line_h - text_h) / 2,
-        r.ImGui_GetColorEx(ctx, color),
-        label
-    )
-    return r.ImGui_IsItemClicked(ctx)
+    return DrawToolbarButton(label, "MODE_" .. label, active)
 end
 
 function test()
@@ -553,7 +678,12 @@ local function Main()
     ImGui.SetNextWindowSizeConstraints(ctx, 500, 500, FLT_MAX, FLT_MAX)
     ImGui.SetNextWindowSize(ctx, 500, 500, ImGui.Cond_FirstUseEver())
 
+    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_ItemSpacing(), PARANORMAL_SPACING, PARANORMAL_SPACING)
+    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_FramePadding(), PARANORMAL_TEXT_PADDING, PARANORMAL_TEXT_PADDING)
+    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowPadding(), PARANORMAL_SPACING, PARANORMAL_SPACING)
+    local shortcuts_focused = false
     local visible, open = r.ImGui_Begin(ctx, 'PARANORMAL FX ROUTER###PARANORMALFX', true, WND_FLAGS)
+    r.ImGui_PopStyleVar(ctx)
 
     if visible then
         AW, AH = r.ImGui_GetContentRegionAvail(ctx)
@@ -582,6 +712,7 @@ local function Main()
             RestoreFromPEXT(MODE)
         end
 
+        PaintModeButtons()
         RunPendingCenterReset()
 
         MonitorLastTouchedFX()
@@ -598,7 +729,9 @@ local function Main()
             Draw()
         end
         r.ImGui_PopFont(ctx)
+        r.ImGui_PushFont(ctx, SYSTEM_FONT_FACTORY)
         UI()
+        r.ImGui_PopFont(ctx)
         r.ImGui_PushFont(ctx, CUSTOM_FONT and SYSTEM_FONT_FACTORY or DEFAULT_FONT_FACTORY)
         if OPEN_SETTINGS then
             DrawUserSettings()
@@ -635,10 +768,13 @@ local function Main()
         RENAME_OPENED = r.ImGui_IsPopupOpen(ctx, "RENAME")
         FILE_MANAGER_OPENED = r.ImGui_IsPopupOpen(ctx, "File Dialog")
 
+        shortcuts_focused = ImGui.IsWindowFocused(ctx, ImGui.FocusedFlags_RootAndChildWindows())
         CheckStaleData()
         ImGui.End(ctx)
     end
+    r.ImGui_PopStyleVar(ctx, 2) -- shared frame padding and toolbar item spacing
     r.ImGui_PopStyleColor(ctx, palette_style_count)
+    UpdateReaperShortcuts(shortcuts_focused, TEXT_INPUT_ACTIVE or FX_OPENED or RENAME_OPENED or FILE_MANAGER_OPENED or false)
     if ESC and ESC_CLOSE then open = nil end
 
     if open then
@@ -660,6 +796,7 @@ local function Main()
 end
 
 function Exit()
+    UpdateReaperShortcuts(false, false)
     if StoreSettings then
         StoreSettings()
     end

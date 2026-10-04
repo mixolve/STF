@@ -1,0 +1,18 @@
+{
+  "package": "@tabler/icons-webfont",
+  "version": "3.48.0",
+  "source": "https://registry.npmjs.org/@tabler/icons-webfont/-/icons-webfont-3.48.0.tgz",
+  "integrity": "sha512-Cwqm0qkn6qqBeoBwDt9nFeMSFnRbwoC3e6y4u+weSroj4lecaFhTUfe2T24/ByQA6Rjn9tq76VhT5PL+5czhAw==",
+  "icons": {
+    "settings": "settings",
+    "home": "home",
+    "refresh": "refresh",
+    "plus": "plus",
+    "parallel": "layout-columns",
+    "enclose": "box",
+    "expand": "chevron-right",
+    "collapse": "chevron-down",
+    "polarityNormal": "circle-plus",
+    "polarityInverted": "circle-minus"
+  }
+}

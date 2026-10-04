@@ -617,7 +617,7 @@ function ClipBoard()
     if not r.ImGui_BeginChild(ctx, "hack44", -FLT_MIN, -FLT_MIN, false, overlay_flags) then
         return
     end
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ChildBg(), 0x333333FF)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ChildBg(), 0x222222FF)
 
     if r.HasExtState("PARANORMALFX2", "COPY_BUFFER") then
         local copy_id = r.GetExtState("PARANORMALFX2", "COPY_BUFFER_ID")

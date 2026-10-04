@@ -8,14 +8,19 @@ for name, func in pairs(reaper) do
     if name then ImGui[name] = func end
 end
 
-local def_vertical_x_center, def_vertical_y_center = 3, 65
+local def_vertical_x_center, def_vertical_y_center = 8, 46
 
 local function GetResetViewTarget()
     local target_x = def_vertical_x_center
     local target_y = def_vertical_y_center
 
-    if SETTINGS_BUTTON_SCREEN_X and MAIN_CANVAS_SCREEN_X then
-        target_x = SETTINGS_BUTTON_SCREEN_X - MAIN_CANVAS_SCREEN_X - 4
+    if WX and MAIN_CANVAS_SCREEN_X then
+        -- Horizontal rows add ItemSpacing before the ROOT rectangle.
+        local row_spacing = 0
+        if not V_LAYOUT then
+            row_spacing = r.ImGui_GetStyleVar(ctx, r.ImGui_StyleVar_ItemSpacing()) * CANVAS.scale
+        end
+        target_x = WX + 8 - MAIN_CANVAS_SCREEN_X - row_spacing
     end
     if MAIN_CANVAS_SCREEN_Y and WY then
         target_y = def_vertical_y_center - (MAIN_CANVAS_SCREEN_Y - WY)
@@ -82,7 +87,7 @@ local function CheckKeys()
     SHIFT = key_mods == ImGui.Mod_Shift()
 
     if TEXT_INPUT_ACTIVE then
-        ImGui.SetNextFrameWantCaptureKeyboard(ctx, false)
+        ImGui.SetNextFrameWantCaptureKeyboard(ctx, true)
         CTRL_DRAG = nil
         MOUSE_DRAG = ImGui.IsMouseDragging(ctx, 0)
         return
@@ -98,7 +103,7 @@ local function CheckKeys()
 
     DEL = ImGui.IsKeyPressed(ctx, ImGui.Key_Delete())
 
-    if HOME then ResetView() end
+    if HOME and TARGET and CANVAS then ResetView() end
 
     -- TOGGLE FX BYPASS
     if CTRL and B then
@@ -130,16 +135,18 @@ local function CheckKeys()
         end
     end
 
-    if CTRL and Z then
-        r.Main_OnCommand(40029, 0)
-        -- CHECK IF TARGET CHANGED
-        TRACK = r.GetSelectedTrack2(0, 0, true)
-    end                            -- UNDO
-    if ImGui.GetKeyMods(ctx) == ImGui.Mod_Shortcut() | ImGui.Mod_Shift() and Z then
-        r.Main_OnCommand(40030, 0) -- REDO
+    if not REAPER_SHORTCUT_BRIDGE then
+        if CTRL and Z then
+            r.Main_OnCommand(40029, 0)
+            -- CHECK IF TARGET CHANGED
+            TRACK = r.GetSelectedTrack2(0, 0, true)
+        end                            -- UNDO
+        if ImGui.GetKeyMods(ctx) == ImGui.Mod_Shortcut() | ImGui.Mod_Shift() and Z then
+            r.Main_OnCommand(40030, 0) -- REDO
+        end
+    
+        if SPACE and (not FX_OPENED and not RENAME_OPENED and not FILE_MANAGER_OPENED) then r.Main_OnCommand(40044, 0) end -- PLAY STOP
     end
-
-    if SPACE and (not FX_OPENED and not RENAME_OPENED and not FILE_MANAGER_OPENED) then r.Main_OnCommand(40044, 0) end -- PLAY STOP
 
     -- ACTIVATE CTRL ONLY IF NOT PREVIOUSLY DRAGGING
     if not CTRL_DRAG then
@@ -156,9 +163,9 @@ local function Rename()
         r.ImGui_SetKeyboardFocusHere(ctx)
         NEW_NAME = tbl[i].name:gsub("(%S+: )", "")
     end
-    RV, NEW_NAME = r.ImGui_InputText(ctx, 'Name', NEW_NAME, r.ImGui_InputTextFlags_AutoSelectAll())
+    RV, NEW_NAME = ParaInputText(ctx, 'Name', NEW_NAME, r.ImGui_InputTextFlags_AutoSelectAll())
     COMMENT_ACTIVE = r.ImGui_IsItemActive(ctx)
-    if r.ImGui_Button(ctx, 'OK') or r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_Enter()) or
+    if ParaButton(ctx, 'OK') or r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_Enter()) or
         r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_KeypadEnter()) then
         NEW_NAME = NEW_NAME:gsub("^%s*(.-)%s*$", "%1") -- remove trailing and leading
         if #NEW_NAME ~= 0 then SAVED_NAME = NEW_NAME end
@@ -172,7 +179,7 @@ local function Rename()
         r.ImGui_CloseCurrentPopup(ctx)
     end
     r.ImGui_SameLine(ctx)
-    if r.ImGui_Button(ctx, 'Cancel') then
+    if ParaButton(ctx, 'Cancel') then
         RENAME_DATA = nil
         r.ImGui_CloseCurrentPopup(ctx)
     end
@@ -184,7 +191,7 @@ end
 
 local function InsertPointsMenu()
     if RC_DATA.lane == "p" then
-        if r.ImGui_MenuItem(ctx, 'RESET LANE VOLUME') then
+        if MonoMenuItem(ctx, 'RESET LANE VOLUME') then
             local parrent_container = GetParentContainerByGuid(RC_DATA.tbl[RC_DATA.i])
             local _, first_idx_in_row = FindNextPrevRow(RC_DATA.tbl, RC_DATA.i, -1)
 
@@ -194,7 +201,7 @@ local function InsertPointsMenu()
             end
         end
         if RC_DATA.tbl[RC_DATA.i].p > 0 then
-            if r.ImGui_MenuItem(ctx, 'ADJUST LANE VOLUME TO UNITY') then
+            if MonoMenuItem(ctx, 'ADJUST LANE VOLUME TO UNITY') then
                 local parrent_container = GetParentContainerByGuid(RC_DATA.tbl[RC_DATA.i])
                 local _, first_idx_in_row, p_cnt = FindNextPrevRow(RC_DATA.tbl, RC_DATA.i, -1)
 
@@ -204,7 +211,7 @@ local function InsertPointsMenu()
                 end
             end
             r.ImGui_Separator(ctx)
-            if r.ImGui_MenuItem(ctx, 'UNBYPASS LANE') then
+            if MonoMenuItem(ctx, 'UNBYPASS LANE') then
                 local parrent_container = GetParentContainerByGuid(RC_DATA.tbl[RC_DATA.i])
                 local _, first_idx_in_row = FindNextPrevRow(RC_DATA.tbl, RC_DATA.i, -1)
                 local _, last_idx_in_row = FindNextPrevRow(RC_DATA.tbl, RC_DATA.i, 1)
@@ -214,7 +221,7 @@ local function InsertPointsMenu()
                     API.SetEnabled(TARGET, item_id, true)
                 end
             end
-            if r.ImGui_MenuItem(ctx, 'ENCLOSE LANE INTO CONT') then
+            if MonoMenuItem(ctx, 'ENCLOSE LANE INTO CONT') then
                 r.Undo_BeginBlock()
                 r.PreventUIRefresh(1)
                 local parrent_container = GetFx(RC_DATA.tbl[RC_DATA.i].pid)
@@ -251,13 +258,13 @@ local function InsertPointsMenu()
         end
         -- SHOW ONLY WHEN CLIPBOARD IS AVAILABLE
         if CLIPBOARD.tbl then
-            if r.ImGui_MenuItem(ctx, 'PASTE') then
+            if MonoMenuItem(ctx, 'PASTE') then
                 Paste(false, true)
             end
         end
     elseif RC_DATA.lane == "s" then
         if CLIPBOARD.tbl then
-            if r.ImGui_MenuItem(ctx, 'PASTE') then
+            if MonoMenuItem(ctx, 'PASTE') then
                 Paste(false, false, true)
             end
         else
@@ -265,7 +272,7 @@ local function InsertPointsMenu()
         end
     elseif RC_DATA.lane == "sc" then
         if CLIPBOARD.tbl then
-            if r.ImGui_MenuItem(ctx, 'PASTE') then
+            if MonoMenuItem(ctx, 'PASTE') then
                 Paste(false, false, true, true)
             end
         else
@@ -312,30 +319,30 @@ local function RightClickMenu()
     end
     local bypass_label = RC_DATA.tbl[RC_DATA.i] and not RC_DATA.tbl[RC_DATA.i].bypass and "BYPASSED" or "BYPASS"
     local bypass_enabled = RC_DATA.type ~= "ROOT" or MODE == "TRACK"
-    if r.ImGui_MenuItem(ctx, bypass_label, nil, false, bypass_enabled) then
+    if MonoMenuItem(ctx, bypass_label, nil, false, bypass_enabled) then
         ToggleContextBypass()
     end
     if RC_DATA.type ~= "ROOT" then
-        if r.ImGui_MenuItem(ctx, 'PARAMETER INSPECTOR', nil, PM_INSPECTOR_FXID == RC_DATA.tbl[RC_DATA.i].FX_ID, not disabled) then
+        if MonoMenuItem(ctx, 'PARAMETER INSPECTOR', nil, PM_INSPECTOR_FXID == RC_DATA.tbl[RC_DATA.i].FX_ID, not disabled) then
             ToggleContextParameterInspector()
         end
         r.ImGui_Separator(ctx)
     end
     if RC_DATA.type ~= "ROOT" then
-        if r.ImGui_MenuItem(ctx, 'RENAME', nil, nil, not disabled) then
+        if MonoMenuItem(ctx, 'RENAME', nil, nil, not disabled) then
             RENAME_DATA = { tbl = RC_DATA.tbl, i = RC_DATA.i }
             OPEN_RENAME = true
         end
 
         if not RC_DATA.tbl[RC_DATA.i].exclude_ara then
-            if r.ImGui_MenuItem(ctx, 'REPLACE', nil, nil, not disabled) then
+            if MonoMenuItem(ctx, 'REPLACE', nil, nil, not disabled) then
                 local parrent_container = GetParentContainerByGuid(RC_DATA.tbl[RC_DATA.i])
                 local item_add_id = CalcFxID(parrent_container, RC_DATA.i)
                 REPLACE_FX_POS = { tbl = RC_DATA.tbl, i = RC_DATA.i, id = item_add_id }
                 OPEN_FX_LIST = true
             end
             r.ImGui_Separator(ctx)
-            if r.ImGui_MenuItem(ctx, 'ENCLOSE INTO CONT', nil, nil, not disabled) then
+            if MonoMenuItem(ctx, 'ENCLOSE INTO CONT', nil, nil, not disabled) then
                 r.Undo_BeginBlock()
                 r.PreventUIRefresh(1)
                 MoveTargetsToNewContainer(RC_DATA.tbl, RC_DATA.i)
@@ -346,69 +353,69 @@ local function RightClickMenu()
                 local can_explode = CheckIfSafeToExplode(RC_DATA.tbl, RC_DATA.i)
                 local no_childs = #RC_DATA.tbl[RC_DATA.i].sub == 0
                 if not can_explode or no_childs then r.ImGui_BeginDisabled(ctx, true) end
-                if r.ImGui_MenuItem(ctx, can_explode and 'EXPLODE CONT' or "EXPLODE (NOT SUPPORTED)", nil, nil, not disabled) then
+                if MonoMenuItem(ctx, can_explode and 'EXPLODE CONT' or "EXPLODE (NOT SUPPORTED)", nil, nil, not disabled) then
                     ExplodeContainer(RC_DATA.tbl, RC_DATA.i)
                 end
                 if not can_explode or no_childs then r.ImGui_EndDisabled(ctx) end
-                if r.ImGui_BeginMenu(ctx, "SURROUND MAPPING") then
+                if BeginMonoMenu(ctx, "SURROUND MAPPING") then
                     local parrent_container = GetParentContainerByGuid(RC_DATA.tbl[RC_DATA.i])
                     local item_id = CalcFxID(parrent_container, RC_DATA.i)                   
 
-                    if r.ImGui_MenuItem(ctx, "Quad - 4ch", nil) then
+                    if MonoMenuItem(ctx, "Quad - 4ch", nil) then
                         SetContainerSurround(item_id, 4)
                         SetChildSurround(RC_DATA.tbl[RC_DATA.i].sub, 4)
                     end
-                    if r.ImGui_MenuItem(ctx, "5.1 - 6ch", nil) then
+                    if MonoMenuItem(ctx, "5.1 - 6ch", nil) then
                         SetContainerSurround(item_id, 6)
                         SetChildSurround(RC_DATA.tbl[RC_DATA.i].sub, 6)
                     end
-                    if r.ImGui_MenuItem(ctx, "7.1 - 8ch", nil) then
+                    if MonoMenuItem(ctx, "7.1 - 8ch", nil) then
                         SetContainerSurround(item_id, 8)
                         SetChildSurround(RC_DATA.tbl[RC_DATA.i].sub, 8)
                     end
-                    if r.ImGui_MenuItem(ctx, "7.1.4 - 12ch", nil) then
+                    if MonoMenuItem(ctx, "7.1.4 - 12ch", nil) then
                         SetContainerSurround(item_id, 12)
                         SetChildSurround(RC_DATA.tbl[RC_DATA.i].sub, 12)
                     end
-                    r.ImGui_EndMenu(ctx)
+                    EndMonoMenu(ctx)
                 end
             end
         end
         r.ImGui_Separator(ctx)
 
-        if r.ImGui_BeginMenu(ctx, "FX SETTINGS", not disabled) then
-            if r.ImGui_BeginMenu(ctx, "OVERSAMPLING") then
+        if BeginMonoMenu(ctx, "FX SETTINGS", not disabled) then
+            if BeginMonoMenu(ctx, "OVERSAMPLING") then
                 local parrent_container = GetParentContainerByGuid(RC_DATA.tbl[RC_DATA.i])
                 local item_id = CalcFxID(parrent_container, RC_DATA.i)
                 local retval1, buf1 = API.GetNamedConfigParm(TARGET, item_id, "chain_oversample_shift")
                 local retval2, buf2 = API.GetNamedConfigParm(TARGET, item_id, "instance_oversample_shift")
 
                 for i = 1, 2 do
-                    if r.ImGui_BeginMenu(ctx, i == 1 and "CHAIN" or "INSTANCE") then
+                    if BeginMonoMenu(ctx, i == 1 and "CHAIN" or "INSTANCE") then
                         for j = 0, 2 do
                             local name = j == 0 and "NONE" or j == 1 and "96kHz" or "192kHz"
-                            if r.ImGui_MenuItem(ctx, name, nil, (i == 1 and buf1 or buf2) == tostring(j)) then
+                            if MonoMenuItem(ctx, name, nil, (i == 1 and buf1 or buf2) == tostring(j)) then
                                 API.SetNamedConfigParm(TARGET, item_id,
                                     i == 1 and "chain_oversample_shift" or "instance_oversample_shift", tostring(j))
                             end
                         end
-                        r.ImGui_EndMenu(ctx)
+                        EndMonoMenu(ctx)
                     end
                 end
-                r.ImGui_EndMenu(ctx)
+                EndMonoMenu(ctx)
             end
             local parrent_container = GetParentContainerByGuid(RC_DATA.tbl[RC_DATA.i])
             local item_id = CalcFxID(parrent_container, RC_DATA.i)
             local retval, buf = API.GetNamedConfigParm(TARGET, item_id, "force_auto_bypass")
-            if r.ImGui_MenuItem(ctx, "AUTO BYPASS ON SILENCE", nil, buf == "1" and true or false) then
+            if MonoMenuItem(ctx, "AUTO BYPASS ON SILENCE", nil, buf == "1" and true or false) then
                 API.SetNamedConfigParm(TARGET, item_id, "force_auto_bypass", buf == "0" and "1" or "0")
             end
-            r.ImGui_EndMenu(ctx)
+            EndMonoMenu(ctx)
         end
         r.ImGui_Separator(ctx)
     end
 
-    if r.ImGui_MenuItem(ctx, 'DELETE') then
+    if MonoMenuItem(ctx, 'DELETE') then
         if SEL_TBL[RC_DATA.tbl[RC_DATA.i].guid] then
             if next(SEL_TBL) then
                 r.Undo_BeginBlock()
@@ -446,11 +453,11 @@ local function RightClickMenu()
     if RC_DATA.type == "ROOT" or RC_DATA.type == "Container" then
         r.ImGui_Separator(ctx)
         if RC_DATA.type == "ROOT" then
-            if r.ImGui_MenuItem(ctx, 'ENCLOSE ALL INTO CONT', nil, nil, API.GetCount(TARGET) ~= 0) then
+            if MonoMenuItem(ctx, 'ENCLOSE ALL INTO CONT', nil, nil, API.GetCount(TARGET) ~= 0) then
                 EncloseAllIntoCont()
             end
         end
-        if r.ImGui_MenuItem(ctx, 'SAVE AS CHAIN', nil, nil, not disabled) then
+        if MonoMenuItem(ctx, 'SAVE AS CHAIN', nil, nil, not disabled) then
             --SAVE_NAME = RC_DATA.tbl[RC_DATA.i].name
             OPEN_FM = true
             FM_TYPE = "SAVE"
@@ -465,7 +472,7 @@ local function RightClickMenu()
     end
     if RC_DATA.type ~= "ROOT" and not RC_DATA.tbl[RC_DATA.i].exclude_ara then
         r.ImGui_Separator(ctx)
-        if r.ImGui_MenuItem(ctx, 'COPY', nil, nil, not disabled) then
+        if MonoMenuItem(ctx, 'COPY', nil, nil, not disabled) then
             local parrent_container = GetParentContainerByGuid(RC_DATA.tbl[RC_DATA.i])
             local item_id = CalcFxID(parrent_container, RC_DATA.i)
             local is_collapsed = CheckCollapse(RC_DATA.tbl[RC_DATA.i], 1, 1)
@@ -488,7 +495,7 @@ local function RightClickMenu()
             r.SetExtState("PARANORMALFX2", "COPY_BUFFER", data, false)
             r.SetExtState("PARANORMALFX2", "COPY_BUFFER_ID", r.genGuid(), false)
         end
-        if r.ImGui_MenuItem(ctx, 'CUT', nil, nil, not disabled) then
+        if MonoMenuItem(ctx, 'CUT', nil, nil, not disabled) then
             local parrent_container = GetParentContainerByGuid(RC_DATA.tbl[RC_DATA.i])
             local item_id = CalcFxID(parrent_container, RC_DATA.i)
             local is_collapsed = CheckCollapse(RC_DATA.tbl[RC_DATA.i], 1, 1)
@@ -519,7 +526,7 @@ local function RightClickMenu()
         -- SHOW ONLY WHEN CLIPBOARD IS AVAILABLE
         if CLIPBOARD.tbl and CLIPBOARD.guid ~= RC_DATA.tbl[RC_DATA.i].guid then
             --! DO NOT ALLOW PASTING ON SELF
-            if r.ImGui_MenuItem(ctx, 'PASTE-REPLACE', nil, nil, not disabled) then
+            if MonoMenuItem(ctx, 'PASTE-REPLACE', nil, nil, not disabled) then
                 Paste(true, RC_DATA.tbl[RC_DATA.i].p > 0, RC_DATA.tbl[RC_DATA.i].p == 0)
             end
         end
@@ -534,7 +541,7 @@ local LFO_defaults = { 0, 1, 0, 1, 1, 0, 0, 0 }
 local function PMMenu()
     if not PM_RC_DATA then return end
     if PM_RC_DATA.type == "ACS" then
-        if r.ImGui_MenuItem(ctx, "RESET TO ACS DEFAULT") then
+        if MonoMenuItem(ctx, "RESET TO ACS DEFAULT") then
             for i = 1, #ACS_TBL do
                 API.SetNamedConfigParm(TARGET, PM_RC_DATA.fx_id,
                     "param." .. PM_RC_DATA.p_id .. ".acs." .. ACS_TBL[i],
@@ -542,7 +549,7 @@ local function PMMenu()
             end
         end
     elseif PM_RC_DATA.type == "LFO" then
-        if r.ImGui_MenuItem(ctx, "RESET TO LFO DEFAULT") then
+        if MonoMenuItem(ctx, "RESET TO LFO DEFAULT") then
             for i = 1, #LFO_TBL do
                 API.SetNamedConfigParm(TARGET, PM_RC_DATA.fx_id,
                     "param." .. PM_RC_DATA.p_id .. ".lfo." .. LFO_TBL[i],
@@ -550,7 +557,7 @@ local function PMMenu()
             end
         end
     elseif PM_RC_DATA.type == "ENV" then
-        if r.ImGui_MenuItem(ctx, "DELETE ENVELOPE") then
+        if MonoMenuItem(ctx, "DELETE ENVELOPE") then
             r.SetCursorContext(2, PM_RC_DATA.fx_id)
             r.Main_OnCommand(40065, 0)
             r.SetCursorContext(2)
@@ -559,6 +566,8 @@ local function PMMenu()
 end
 
 local function Popups()
+    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowPadding(), PARANORMAL_TEXT_PADDING + PARANORMAL_BORDER_WIDTH, PARANORMAL_TEXT_PADDING)
+    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_FramePadding(), PARANORMAL_TEXT_PADDING + PARANORMAL_BORDER_WIDTH, PARANORMAL_TEXT_PADDING)
     local center = { r.ImGui_Viewport_GetCenter(r.ImGui_GetWindowViewport(ctx)) }
 
     if OPEN_PM_MENU then
@@ -568,10 +577,12 @@ local function Popups()
         end
     end
 
+    r.ImGui_PushFont(ctx, SYSTEM_FONT_FACTORY)
     if r.ImGui_BeginPopup(ctx, "PM_MENU", r.ImGui_WindowFlags_NoMove()) then
         PMMenu()
         r.ImGui_EndPopup(ctx)
     end
+    r.ImGui_PopFont(ctx)
 
     if OPEN_INSERT_POINTS_MENU then
         OPEN_INSERT_POINTS_MENU = nil
@@ -580,10 +591,12 @@ local function Popups()
         end
     end
 
+    r.ImGui_PushFont(ctx, SYSTEM_FONT_FACTORY)
     if r.ImGui_BeginPopup(ctx, "INSERT_POINTS_MENU", r.ImGui_WindowFlags_NoMove()) then
         InsertPointsMenu()
         r.ImGui_EndPopup(ctx)
     end
+    r.ImGui_PopFont(ctx)
 
     if OPEN_RIGHT_CLICK_MENU then
         OPEN_RIGHT_CLICK_MENU = nil
@@ -592,10 +605,12 @@ local function Popups()
         end
     end
 
+    r.ImGui_PushFont(ctx, SYSTEM_FONT_FACTORY)
     if r.ImGui_BeginPopup(ctx, "RIGHT_CLICK_MENU", r.ImGui_WindowFlags_NoMove()) then
         RightClickMenu()
         r.ImGui_EndPopup(ctx)
     end
+    r.ImGui_PopFont(ctx)
 
     if OPEN_RENAME then
         OPEN_RENAME = nil
@@ -613,16 +628,16 @@ local function Popups()
             rename_style_count = rename_style_count + 1
         end
     end
-    PushRenameStyle(r.ImGui_Col_PopupBg, 0x333333FF)
-    PushRenameStyle(r.ImGui_Col_TitleBg, 0x333333FF)
+    PushRenameStyle(r.ImGui_Col_PopupBg, 0x222222FF)
+    PushRenameStyle(r.ImGui_Col_TitleBg, 0x222222FF)
     PushRenameStyle(r.ImGui_Col_TitleBgActive, 0x666666FF)
-    PushRenameStyle(r.ImGui_Col_TitleBgCollapsed, 0x333333FF)
-    PushRenameStyle(r.ImGui_Col_FrameBg, 0x333333FF)
-    PushRenameStyle(r.ImGui_Col_FrameBgHovered, 0x333333FF)
+    PushRenameStyle(r.ImGui_Col_TitleBgCollapsed, 0x222222FF)
+    PushRenameStyle(r.ImGui_Col_FrameBg, 0x222222FF)
+    PushRenameStyle(r.ImGui_Col_FrameBgHovered, 0x222222FF)
     PushRenameStyle(r.ImGui_Col_FrameBgActive, 0x9999FFFF)
     PushRenameStyle(r.ImGui_Col_TextSelectedBg, 0x666666FF)
-    PushRenameStyle(r.ImGui_Col_Button, 0x333333FF)
-    PushRenameStyle(r.ImGui_Col_ButtonHovered, 0x333333FF)
+    PushRenameStyle(r.ImGui_Col_Button, 0x222222FF)
+    PushRenameStyle(r.ImGui_Col_ButtonHovered, 0x222222FF)
     PushRenameStyle(r.ImGui_Col_ButtonActive, 0x9999FFFF)
     if r.ImGui_BeginPopupModal(ctx, 'RENAME', nil,
             r.ImGui_WindowFlags_AlwaysAutoResize() | r.ImGui_WindowFlags_TopMost()) then
@@ -655,12 +670,39 @@ local function Popups()
         end
     end
 
+    local fx_menu_colours = {
+        {r.ImGui_Col_PopupBg(), 0x222222FF},
+        {r.ImGui_Col_PopupBg(), 0x222222FF},
+        {r.ImGui_Col_Text(), 0xFFFFFFFF},
+        {r.ImGui_Col_Border(), 0xBBBBBBFF},
+        {r.ImGui_Col_Separator(), 0xBBBBBBFF},
+        {r.ImGui_Col_FrameBg(), 0x444444FF},
+        {r.ImGui_Col_FrameBgHovered(), 0x444444FF},
+        {r.ImGui_Col_FrameBgActive(), 0x444444FF},
+        {r.ImGui_Col_Header(), 0xBBBBBBFF},
+        {r.ImGui_Col_HeaderHovered(), 0xBBBBBBFF},
+        {r.ImGui_Col_HeaderActive(), 0xBBBBBBFF},
+        {r.ImGui_Col_Button(), 0x444444FF},
+        {r.ImGui_Col_ButtonHovered(), 0x444444FF},
+        {r.ImGui_Col_ButtonActive(), 0xBBBBBBFF},
+        {r.ImGui_Col_CheckMark(), 0xFFFFFFFF},
+        {r.ImGui_Col_TextSelectedBg(), 0xBBBBBB88},
+        {r.ImGui_Col_ScrollbarBg(), 0x222222FF},
+        {r.ImGui_Col_ScrollbarGrab(), 0xBBBBBBFF},
+        {r.ImGui_Col_ScrollbarGrabHovered(), 0xBBBBBBFF},
+        {r.ImGui_Col_ScrollbarGrabActive(), 0xFFFFFFFF},
+    }
+    for _, entry in ipairs(fx_menu_colours) do r.ImGui_PushStyleColor(ctx, entry[1], entry[2]) end
+    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_PopupBorderSize(), 1)
+    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_FrameBorderSize(), 1)
+    r.ImGui_PushFont(ctx, SYSTEM_FONT_FACTORY)
     if r.ImGui_BeginPopup(ctx, "FX LIST", r.ImGui_WindowFlags_NoMove()) then
-        --r.ImGui_PushFont(ctx, SELECTED_FONT)
         DrawFXList()
-        --r.ImGui_PopFont(ctx)
         r.ImGui_EndPopup(ctx)
     end
+    r.ImGui_PopFont(ctx)
+    r.ImGui_PopStyleVar(ctx, 2)
+    r.ImGui_PopStyleColor(ctx, #fx_menu_colours)
 
     if not r.ImGui_IsPopupOpen(ctx, "FX LIST") then
         if #FILTER ~= 0 then FILTER = '' end
@@ -680,6 +722,7 @@ local function Popups()
     if not r.ImGui_IsPopupOpen(ctx, "PM_MENU") then
         if PM_RC_DATA then PM_RC_DATA = nil end
     end
+    r.ImGui_PopStyleVar(ctx, 2)
 end
 
 function StoreSettings()
@@ -736,7 +779,7 @@ local function DefaultHorizontal()
     --LAST_V_BTN_H = ADD_BTN_H
     --LAST_NEW_Y = new_spacing_y
     --ADD_BTN_W = 22
-    ADD_BTN_H = 22
+    ADD_BTN_H = 30
 end
 
 local function RevertVertical()
@@ -866,7 +909,7 @@ local function PMTable()
                         if ALT then
                             r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonActive(), 0xFF9999FF)
                         end
-                        if r.ImGui_Button(ctx, p_name, -FLT_MIN, 0.0) then
+                        if ParaButton(ctx, p_name, -FLT_MIN, 0.0) then
                             if ALT then
                                 r.Undo_BeginBlock()
                                 API.SetNamedConfigParm(TARGET, PM_INSPECTOR_FXID, "param." .. p_id .. ".mod.active",
@@ -954,7 +997,7 @@ local function PMTable()
                             is_visible = env_chunk:find("VIS 1", nil, true) and true or false
                         end
                         if has_points then
-                            r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBg(), 0x99CC99FF)
+                            r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBg(), 0xBBBBBBFF)
                         end
                         if r.ImGui_Checkbox(ctx, "##ENV_new" .. PM_INSPECTOR_FXID .. p_id, is_visible) then
                             API.GetFXEnvelope(TARGET, PM_INSPECTOR_FXID, p_id, true)
@@ -1002,7 +1045,7 @@ function DrawPMInspector()
     if not PM_INSPECTOR_FXID then return end
     local WX, WY = r.ImGui_GetWindowPos(ctx)
 
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ChildBg(), 0x333333FF)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_PopupBg(), 0x222222FF)
     r.ImGui_SetNextWindowPos(ctx, WX + 5, WY + 85)
     local total_columns = 2
     if r.ImGui_BeginChild(ctx, "PM_INSPECTOR", 350, 400, true) then
@@ -1011,8 +1054,8 @@ function DrawPMInspector()
         local aw = r.ImGui_GetContentRegionAvail(ctx)
         r.ImGui_Text(ctx, "PARAMETER INSPECTOR")
         r.ImGui_SameLine(ctx, aw - s_frame_x)
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0x333333FF)
-        if r.ImGui_Button(ctx, "X") then
+        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), 0x222222FF)
+        if ParaButton(ctx, "X") then
             OPEN_PM_INSPECTOR = nil
         end
         r.ImGui_PopStyleColor(ctx)
@@ -1036,12 +1079,12 @@ function DrawPMInspector()
                     for column = 0, total_columns - 1 do
                         ImGui.TableSetColumnIndex(ctx, column)
                         if column == 0 then
-                            if r.ImGui_Button(ctx, p_name, -FLT_MIN) then
+                            if ParaButton(ctx, p_name, -FLT_MIN) then
                                 API.SetNamedConfigParm(TARGET, LASTTOUCH_FX_ID,
                                     "param." .. LASTTOUCH_P_ID .. ".mod.visible", "1")
                             end
                         elseif column == 1 then
-                            if r.ImGui_Button(ctx, "SET##ALL", -FLT_MIN, 0) then
+                            if ParaButton(ctx, "SET##ALL", -FLT_MIN, 0) then
                                 r.Undo_BeginBlock()
                                 API.SetNamedConfigParm(TARGET, LASTTOUCH_FX_ID,
                                     "param." .. LASTTOUCH_P_ID .. ".mod.visible", "1")
@@ -1057,7 +1100,7 @@ function DrawPMInspector()
                             end
                         elseif column == 2 then
                             if PM_INSPECTOR_FXID == LASTTOUCH_FX_ID then
-                                if r.ImGui_Button(ctx, "SHOW##ENV") then
+                                if ParaButton(ctx, "SHOW##ENV") then
                                     local fx_env = API.GetFXEnvelope(TARGET, PM_INSPECTOR_FXID, LASTTOUCH_FX_ID, false)
 
                                     local retval, env_chunk, is_visible
@@ -1086,7 +1129,7 @@ function DrawPMInspector()
                 end
             end
         end
-        if r.ImGui_BeginMenu(ctx, "PARAMETER LIST") then
+        if BeginMonoMenu(ctx, "PARAMETER LIST") then
             for p_id = 0, API.GetNumParams(TARGET, PM_INSPECTOR_FXID) do
                 local rv, p_name = API.GetParamName(TARGET, PM_INSPECTOR_FXID, p_id)
                 local _, mod = API.GetNamedConfigParm(TARGET, PM_INSPECTOR_FXID, "param." .. p_id .. ".mod.active")
@@ -1099,7 +1142,7 @@ function DrawPMInspector()
                     if ALT then
                         r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderActive(), 0xFF9999FF)
                     end
-                    if is_there then r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Header(), 0x99CC99FF) end
+                    if is_there then r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Header(), 0xBBBBBBFF) end
                     if r.ImGui_Selectable(ctx, p_name, is_there, r.ImGui_SelectableFlags_DontClosePopups()) then
                         if ALT then
                             r.Undo_BeginBlock()
@@ -1128,7 +1171,7 @@ function DrawPMInspector()
             if not child_hovered then
                 r.ImGui_CloseCurrentPopup(ctx)
             end
-            r.ImGui_EndMenu(ctx)
+            EndMonoMenu(ctx)
         end
 
         r.ImGui_Separator(ctx)
@@ -1142,17 +1185,9 @@ end
 function DrawUserSettings()
     local WX, WY = r.ImGui_GetWindowPos(ctx)
     local WH = r.ImGui_GetWindowHeight(ctx)
-    local overlay_flags = r.ImGui_WindowFlags_NoInputs()
-        | r.ImGui_WindowFlags_NoBackground()
-        | r.ImGui_WindowFlags_NoScrollbar()
-        | r.ImGui_WindowFlags_NoScrollWithMouse()
-
-    if not r.ImGui_BeginChild(ctx, 'toolbars', -FLT_MIN, -FLT_MIN, false, overlay_flags) then
-        return
-    end
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ChildBg(), 0x333333FF)
-    local settings_y = WY + 95
-    r.ImGui_SetNextWindowPos(ctx, WX + 5, settings_y)
+    local settings_x = SETTINGS_BUTTON_SCREEN_X or WX + PARANORMAL_SPACING
+    local settings_y = (SETTINGS_BUTTON_SCREEN_Y or WY + PARANORMAL_SPACING)
+        + TOOLBAR_BUTTON_HEIGHT + PARANORMAL_SPACING
     local item_h = r.ImGui_GetTextLineHeightWithSpacing(ctx)
     local new_im_padding = item_h * 2 + s_frame_y * 2
 
@@ -1166,10 +1201,30 @@ function DrawUserSettings()
     if CLH_BEHAVIORS then
         settings_min_h = settings_min_h + item_h * 18
     end
-    local settings_max_h = math.max(item_h * 8, WH - (settings_y - WY) - 8)
+    local settings_max_h = math.max(item_h * 8, 700)
     local settings_content_h = SETTINGS_CONTENT_H or settings_min_h
     local settings_h = math.min(math.max(settings_min_h, settings_content_h) + 12, settings_max_h)
-    if r.ImGui_BeginChild(ctx, "USERSETTIGS", 220, settings_h, false) then --718
+    if OPEN_SETTINGS_REQUESTED then
+        r.ImGui_OpenPopup(ctx, "PARANORMAL_SETTINGS")
+        OPEN_SETTINGS_REQUESTED = nil
+    end
+    r.ImGui_SetNextWindowPos(ctx, settings_x, settings_y)
+    r.ImGui_SetNextWindowSize(ctx, 360, settings_h)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_PopupBg(), 0x222222FF)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Header(), 0x444444FF)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderHovered(), 0x444444FF)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBgActive(), 0x444444FF)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_SliderGrab(), 0xFFFFFFFF)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_SliderGrabActive(), 0xFFFFFFFF)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_NavHighlight(), 0xFFFFFFFF)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_CheckMark(), 0xFFFFFFFF)
+    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowPadding(),
+        PARANORMAL_TEXT_PADDING + PARANORMAL_BORDER_WIDTH,
+        PARANORMAL_TEXT_PADDING + PARANORMAL_BORDER_WIDTH)
+    local flags = r.ImGui_WindowFlags_NoMove() | r.ImGui_WindowFlags_NoSavedSettings()
+    local settings_visible = r.ImGui_BeginPopup(ctx, "PARANORMAL_SETTINGS", flags)
+    r.ImGui_PopStyleVar(ctx)
+    if settings_visible then
         SETTINGS_HOVERED = r.ImGui_IsWindowHovered(ctx)
         local COLOR = GetColorTbl()
         --r.ImGui_SeparatorText(ctx, "LAYOUT")
@@ -1228,7 +1283,7 @@ function DrawUserSettings()
             r.ImGui_SetNextItemWidth(ctx, 100)
 
             if not V_LAYOUT then r.ImGui_BeginDisabled(ctx, true) end
-            _, ADD_BTN_H = r.ImGui_SliderInt(ctx, "+ HEIGHT", ADD_BTN_H, 10, 22)
+            _, ADD_BTN_H = r.ImGui_SliderInt(ctx, "+ HEIGHT", ADD_BTN_H, 10, 30)
             r.ImGui_SetNextItemWidth(ctx, 100)
             if not V_LAYOUT then r.ImGui_EndDisabled(ctx) end
 
@@ -1299,7 +1354,7 @@ function DrawUserSettings()
         end
         r.ImGui_Separator(ctx)
 
-        if r.ImGui_Button(ctx, "DEFAULT") then
+        if ParaButton(ctx, "DEFAULT") then
             V_LAYOUT = true
             ZOOM_MAX = 1
             SHOW_C_CONTENT_TOOLTIP = false
@@ -1310,12 +1365,12 @@ function DrawUserSettings()
             CTRL_DRAG_AUTOCONTAINER = false
             CUSTOM_FONT = nil
             SELECTED_FONT = DEFAULT_FONT
-            new_spacing_y = 10
+            new_spacing_y = 8
             Knob_Radius = CUSTOM_BTN_H // 2
             ROUND_CORNER = 2
             WireThickness = 1
-            ADD_BTN_W = 55
-            ADD_BTN_H = 14
+            ADD_BTN_W = 30
+            ADD_BTN_H = 30
             CENTER_RESET = false
             SHOW_ADD_FX_ALL_PLUGINS = true
             SHOW_ADD_FX_CATEGORY = true
@@ -1328,28 +1383,28 @@ function DrawUserSettings()
             SHOW_ADD_FX_AUDIO_PLUGINS = false
             ADD_FX_MARKED = {}
             local NEW_COLOR = {
-                ["bg"]           = 0x333333FF,
-                ["n"]            = 0x99CC99FF,
-                ["Container"]    = 0x99CC99FF,
-                ["enclose"]      = 0x333333FF,
-                ["knob_bg"]      = 0x333333FF,
-                ["knob_vol"]     = 0x99CC99FF,
+                ["bg"]           = 0x222222FF,
+                ["n"]            = 0xBBBBBBFF,
+                ["Container"]    = 0xBBBBBBFF,
+                ["enclose"]      = 0x222222FF,
+                ["knob_bg"]      = 0x222222FF,
+                ["knob_vol"]     = 0xBBBBBBFF,
                 ["knob_drywet"]  = 0x99CCCCFF,
                 ["midi"]         = 0x9999FFFF,
                 ["del"]          = 0xFF9999FF,
-                ["ROOT"]         = 0x99CC99FF,
-                ["add"]          = 0x333333FF,
-                ["parallel"]     = 0x333333FF,
+                ["ROOT"]         = 0xBBBBBBFF,
+                ["add"]          = 0x222222FF,
+                ["parallel"]     = 0x222222FF,
                 ["bypass"]       = 0xFF9999FF,
-                ["enabled"]      = 0x99CC99FF,
+                ["enabled"]      = 0xBBBBBBFF,
                 ["wire"]         = 0xCCCCCCFF,
                 ["dnd"]          = 0x99CCCCFF,
-                ["dnd_enclose"]  = 0x99CC99FF,
+                ["dnd_enclose"]  = 0xBBBBBBFF,
                 ["dnd_replace"]  = 0xFF9999FF,
                 ["dnd_swap"]     = 0xFFCC99FF,
                 ["sine_anim"]    = 0x99CCCCFF,
                 ["phase"]        = 0x9999FFFF,
-                ["cut"]          = 0x99CC99FF,
+                ["cut"]          = 0xBBBBBBFF,
                 ["menu_txt_col"] = 0x99CCCCFF,
                 ["offline"]      = 0x666666FF,
                 ["active_PM"]    = 0x99CCCCFF,
@@ -1360,179 +1415,69 @@ function DrawUserSettings()
         end
         r.ImGui_SameLine(ctx)
 
-        if r.ImGui_Button(ctx, "DELETE SAVED") then
+        if ParaButton(ctx, "DELETE SAVED") then
             SETTINGS_DELETED = true
             r.DeleteExtState("PARANORMALFX2", "SETTINGS", true)
         end
         SETTINGS_CONTENT_H = r.ImGui_GetCursorPosY(ctx) + item_h
-        r.ImGui_EndChild(ctx)
+        r.ImGui_EndPopup(ctx)
     end
-    r.ImGui_PopStyleColor(ctx)
-    r.ImGui_EndChild(ctx)
+    r.ImGui_PopStyleColor(ctx, 8)
+    if not r.ImGui_IsPopupOpen(ctx, "PARANORMAL_SETTINGS") then
+        OPEN_SETTINGS = false
+        StoreSettings()
+    end
 end
 
 local function TooltipUI(str)
     return
 end
 
-function DrawListButton2(name, color, hover, icon, round_side, shrink, active, txt_align)
-    local rect_col = color
-    local xs, ys = r.ImGui_GetItemRectMin(ctx)
-    local xe, ye = r.ImGui_GetItemRectMax(ctx)
-    local w = xe - xs
-    local h = ye - ys
-
-    local round_flag = round_side and ROUND_FLAG[round_side] or nil
-    local round_amt = round_flag and ROUND_CORNER or 0.5
-
-    r.ImGui_DrawList_AddRectFilled(draw_list, shrink and xs + shrink or xs, ys, shrink and xe - shrink or xe, ye,
-        r.ImGui_GetColorEx(ctx, rect_col), round_amt,
-        round_flag)
-    if icon then r.ImGui_PushFont(ctx, ICONS_FONT_SMALL_FACTORY) end
-
-    local label_size = r.ImGui_CalcTextSize(ctx, name)
-    local font_size = r.ImGui_GetFontSize(ctx)
-    local font_color = 0xFFFFFFFF
-
-    local txt_x = xs + (w / 2) - (label_size / 2)
-    txt_x = txt_align == "L" and xs or txt_x
-    txt_x = txt_align == "R" and xe - label_size - shrink - (name_margin // 2) or txt_x
-    txt_x = txt_align == "LC" and xs + (w / 2) - (label_size / 2) - (collapse_btn_size // 4) or txt_x
-
-    local txt_y = ys + (h / 2) - (font_size / 2)
-    r.ImGui_DrawList_AddTextEx(draw_list, nil, font_size, txt_x, txt_y, r.ImGui_GetColorEx(ctx, font_color), name)
-
-    if icon then r.ImGui_PopFont(ctx) end
-end
-
-local function ToolbarTextButton(label, width, height, active, active_color, id)
-    r.ImGui_PushFont(ctx, TOOLBAR_TEXT_FONT or SYSTEM_FONT)
-    local x, y = r.ImGui_GetCursorScreenPos(ctx)
-    local label_w, label_h = r.ImGui_CalcTextSize(ctx, label)
-    local clicked = r.ImGui_InvisibleButton(ctx, id or label, width, height)
-    local text_color = active and active_color or 0xFFFFFFFF
-    r.ImGui_DrawList_AddTextEx(
-        draw_list,
-        nil,
-        r.ImGui_GetFontSize(ctx),
-        x + (width - label_w) / 2,
-        y + (height - label_h) / 2,
-        r.ImGui_GetColorEx(ctx, text_color),
-        label
-    )
-    r.ImGui_PopFont(ctx)
-    return clicked
-end
-
 local sin = math.sin
 local m_wheel_i = 1
 function UI()
     if not TARGET then return end
-    local top_tabs_offset = 23
-    r.ImGui_SetCursorPos(ctx, 5, r.ImGui_IsWindowDocked(ctx) and 5 + top_tabs_offset or 25 + top_tabs_offset)
+    local toolbar_x = PARANORMAL_SPACING + GetToolbarButtonWidth("TRACK") + GetToolbarButtonWidth("ITEM") + PARANORMAL_SPACING + PARANORMAL_SPACING * 2
+    local toolbar_y = PARANORMAL_SPACING
+    r.ImGui_SetCursorPos(ctx, toolbar_x, toolbar_y + (r.ImGui_IsWindowDocked(ctx) and 0 or 20))
     -- NIFTY HACK FOR COMMENT BOX NOT OVERLAP UI BUTTONS
     local overlay_flags = r.ImGui_WindowFlags_NoInputs()
         | r.ImGui_WindowFlags_NoBackground()
         | r.ImGui_WindowFlags_NoScrollbar()
         | r.ImGui_WindowFlags_NoScrollWithMouse()
-    if not r.ImGui_BeginChild(ctx, 'toolbars', -FLT_MIN, -FLT_MIN, false, overlay_flags) then
+    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowPadding(), 0, 0)
+    local toolbar_visible = r.ImGui_BeginChild(ctx, 'toolbars', -FLT_MIN, -FLT_MIN, false, overlay_flags)
+    r.ImGui_PopStyleVar(ctx)
+    if not toolbar_visible then
+        r.ImGui_EndChild(ctx)
         return
     end
 
-    local rescan_w = 22
-    r.ImGui_Dummy(ctx, 0, 4)
-    r.ImGui_Indent(ctx, 2)
+    local toolbar_button_w = GetToolbarButtonWidth("SETT")
     local top_buttons_flags = r.ImGui_WindowFlags_NoBackground()
         | r.ImGui_WindowFlags_NoScrollbar()
         | r.ImGui_WindowFlags_NoScrollWithMouse()
-    if r.ImGui_BeginChild(ctx, "TopButtons", 82, def_btn_h + (s_window_y * 2), false, top_buttons_flags) then
+    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowPadding(), 0, 0)
+    local top_buttons_visible = r.ImGui_BeginChild(ctx, "TopButtons", GetToolbarButtonWidth("SETT") + GetToolbarButtonWidth("REFR") + select(1, r.ImGui_GetStyleVar(ctx, r.ImGui_StyleVar_ItemSpacing())) + 1, TOOLBAR_BUTTON_HEIGHT + 1, false, top_buttons_flags)
+    r.ImGui_PopStyleVar(ctx)
+    if top_buttons_visible then
         UI_HOVERED = r.ImGui_IsWindowHovered(ctx)
         SETTINGS_BUTTON_SCREEN_X, SETTINGS_BUTTON_SCREEN_Y = r.ImGui_GetCursorScreenPos(ctx)
-        if r.ImGui_InvisibleButton(ctx, "settings", 22, def_btn_h) then
+        if DrawToolbarButton("SETT", "settings", OPEN_SETTINGS) then
             if OPEN_SETTINGS then
                 StoreSettings()
             end
             OPEN_SETTINGS = not OPEN_SETTINGS
+            OPEN_SETTINGS_REQUESTED = OPEN_SETTINGS
         end
         TooltipUI("SETTINGS")
-        DrawListButton2("$", 0x333333FF, false, true)
         r.ImGui_SameLine(ctx)
-        if r.ImGui_InvisibleButton(ctx, "H", 22, def_btn_h) then
-            ResetView()
-        end
-        if r.ImGui_IsItemHovered(ctx) and r.ImGui_IsMouseClicked(ctx, 1) then
-            if CANVAS.scale ~= 1 then
-                FLUX.to(CANVAS, 0.5, { scale = 1 }):ease("cubicout"):oncomplete(ResetView)
-            else
-                ResetView()
-            end
-        end
-        local color_over_time = ((sin(r.time_precise() * 4) - 0.5) * 20) // 1
-        local color = OFF_SCREEN and 0x333333FF or IncreaseDecreaseBrightness(0xFF9999FF, color_over_time, "no_alpha")
-        DrawListButton2("&", color, false, true)
-        TooltipUI("RESET VIEW\nRIGHT CLICK RESETS VIEW AND ZOOM")
-        r.ImGui_SameLine(ctx)
-        if r.ImGui_InvisibleButton(ctx, "R##rescan", rescan_w, def_btn_h) then
+        if DrawToolbarButton("REFR", "rescan", false) then
             RescanFxList()
         end
-        DrawListButton2("Q", 0x333333FF, false, true)
-        r.ImGui_EndChild(ctx)
     end
-    r.ImGui_Unindent(ctx, 2)
     r.ImGui_EndChild(ctx)
-end
-
-function CheckOverlap(tbl, i)
-    if not MARQUEE then return end
-    if tbl.type == "ROOT" then return end
-    local function Get_Node_Screen_position(n)
-        local x, y = CANVAS.view_x + CANVAS.off_x, CANVAS.view_y + CANVAS.off_y
-        local n_x, n_y = x + (n.x * CANVAS.scale), y + (n.y * CANVAS.scale)
-        local n_w, n_h = n.w * CANVAS.scale, n.h * CANVAS.scale
-        return n_x, n_y, n_x + n_w, n_y + n_h, n_w, n_h
-    end
-    local xs, ys = r.ImGui_GetItemRectMin(ctx)
-    local xe, ye = r.ImGui_GetItemRectMax(ctx)
-
-    local MXS, MYS, MXE, MYE = Get_Node_Screen_position(MARQUEE)
-
-    local overlap = MXS < xe and MXE > xs and MYS < ye and MYE > ys
-    --if overlap then
-    if SHIFT or CTRL then
-        if overlap then
-            SEL_TBL[tbl.guid] = tbl
-        end
-    else
-        SEL_TBL[tbl.guid] = overlap and tbl or nil
-    end
-
-    --end
-
-    --return MXS < xe and MXE > xs and MYS < ye and MYE > ys
-end
-
-local min, abs = math.min, math.abs
-function Draw_MARQUEE()
-    if not r.ImGui_IsWindowHovered(ctx) and not MARQUEE then return end
-    if (r.ImGui_IsAnyItemHovered(ctx) and r.ImGui_IsAnyItemActive(ctx)) then return end
-
-    if r.ImGui_IsMouseDragging(ctx, 0) then
-        local mpx, mpy = r.ImGui_GetMouseClickedPos(ctx, 0)
-        local MQ_dx, MQ_dy = r.ImGui_GetMouseDragDelta(ctx, mpx, mpy, 0)
-        MARQUEE = {
-            x = (min(mpx, mpx + MQ_dx) - (CANVAS.view_x + CANVAS.off_x)) / CANVAS.scale,
-            y = (min(mpy, mpy + MQ_dy) - (CANVAS.view_y + CANVAS.off_y)) / CANVAS.scale,
-            w = abs(MQ_dx) / CANVAS.scale,
-            h = abs(MQ_dy) / CANVAS.scale,
-        }
-        r.ImGui_DrawList_AddRectFilled(draw_list, mpx, mpy, mpx + MQ_dx, mpy + MQ_dy, 0xCCCCCCFF)
-        r.ImGui_DrawList_AddRect(draw_list, mpx, mpy, mpx + MQ_dx, mpy + MQ_dy, 0x9999FFFF)
-    else
-        if r.ImGui_IsMouseReleased(ctx, 0) and MARQUEE then
-            MARQUEE = nil
-            MARQUEE_SHIFT = nil
-        end
-    end
+    r.ImGui_EndChild(ctx)
 end
 
 function CheckStaleData()
@@ -1546,8 +1491,8 @@ function CheckStaleData()
 end
 
 function CanvasLoop()
-    if not TARGET then return end
     CheckKeys()
+    if not TARGET then return end
     Popups()
 end
 
