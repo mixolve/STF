@@ -995,13 +995,19 @@ local function FilterBox()
         r.ImGui_SetNextFrameWantCaptureKeyboard(ctx, true)
     end
     local filtered_fx = Filter_actions(FILTER, FX_SEARCH_LIST or FX_LIST)
-    local row_h = r.ImGui_GetTextLineHeightWithSpacing(ctx)
-    local _, padding_y = r.ImGui_GetStyleVar(ctx, r.ImGui_StyleVar_WindowPadding())
+    local row_h = r.ImGui_GetTextLineHeight(ctx)
+    local _, spacing_y = r.ImGui_GetStyleVar(ctx, r.ImGui_StyleVar_ItemSpacing())
+    local padding_x = r.ImGui_GetStyleVar(ctx, r.ImGui_StyleVar_WindowPadding())
     local visible_rows = math.min(#filtered_fx, 20)
-    local filter_h = visible_rows * row_h + padding_y * 2 + 1
+    -- Rows are text-height tall with item spacing between them. The row highlight
+    -- overhangs half a spacing on each side: offset the rows by that much and end
+    -- the child right after the last highlight so no empty strip remains below.
+    local filter_h = visible_rows * row_h + (visible_rows - 1) * spacing_y + spacing_y + 1
     ADDFX_Sel_Entry = SetMinMax(ADDFX_Sel_Entry or 1, 1, #filtered_fx)
     if #filtered_fx ~= 0 then
+        r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowPadding(), padding_x, 0)
         if r.ImGui_BeginChild(ctx, "##popupp", MAX_FX_SIZE, filter_h, false, r.ImGui_WindowFlags_AlwaysUseWindowPadding()) then
+            r.ImGui_SetCursorPosY(ctx, spacing_y * 0.5)
             for i = 1, #filtered_fx do
                 local visible_name = DisplaySearchFxName(filtered_fx[i].display or filtered_fx[i].name) .. "##filtered_fx" .. i
                 if DrawAddFxSelectable(visible_name, filtered_fx[i].name, i == ADDFX_Sel_Entry) then
@@ -1012,6 +1018,7 @@ local function FilterBox()
             end
         end
         r.ImGui_EndChild(ctx)
+        r.ImGui_PopStyleVar(ctx)
         local enter_pressed = r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_Enter())
             or r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_KeypadEnter())
         if enter_pressed then

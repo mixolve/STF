@@ -6,6 +6,12 @@ PARANORMAL_TEXT_PADDING = 8
 PARANORMAL_BORDER_WIDTH = 1
 PARANORMAL_ROW_HEIGHT = 30
 local cache = {}
+-- Capital-letter band of the text font ("A" glyph): the fixed vertical
+-- reference used for centring. Centring by a string's own ink box makes rows
+-- with parentheses or descenders sit a pixel higher than plain capital rows.
+local caps_glyph = metrics.text.glyphs[65]
+local CAPS_TOP = caps_glyph and caps_glyph[3] or 0
+local CAPS_HEIGHT = caps_glyph and caps_glyph[5] or 0
 
 function ParaTextBounds(text, icon)
     text = tostring(text):gsub("##.*$", "")
@@ -53,13 +59,23 @@ end
 
 function ParaDrawText(list, text, x1, y1, x2, y2, colour, align, icon, border)
     local inset = (icon and 0 or PARANORMAL_TEXT_PADDING) + (border or 0)
+    -- Vertical padding is only the border: rows are just text-height + spacing
+    -- tall, and a large vertical inset would clip the glyph tops/bottoms.
+    -- Symmetric vertical insets keep the text centered, so it does not move.
+    local inset_y = border or 0
     local available_w = math.max(0, x2-x1+1-2*inset)
-    local available_h = math.max(0, y2-y1+1-2*inset)
+    local available_h = math.max(0, y2-y1+1-2*inset_y)
     local visible = icon and text or ParaFitText(text, available_w)
     local b = ParaTextBounds(visible, icon)
     local x = x1 + inset + (available_w-b[3]) * (align or 0.5) - b[1]
-    local y = y1 + inset + (available_h-b[4])/2 - b[2]
-    r.ImGui_DrawList_PushClipRect(list, x1+inset, y1+inset, x2+1-inset, y2+1-inset, true)
+    -- Centre text by the capital-letter band so every row sits at the same
+    -- height regardless of parentheses, descenders or ellipsis in the string.
+    local ref_top, ref_h = b[2], b[4]
+    if not icon and CAPS_HEIGHT > 0 then
+        ref_top, ref_h = CAPS_TOP, CAPS_HEIGHT
+    end
+    local y = y1 + inset_y + (available_h-ref_h)/2 - ref_top
+    r.ImGui_DrawList_PushClipRect(list, x1+inset, y1+inset_y, x2+1-inset, y2+1-inset_y, true)
     r.ImGui_DrawList_AddTextEx(list, icon and ICONS_FONT_SMALL or SYSTEM_FONT_FACTORY,
         icon and ICON_FONT_SIZE or ORG_FONT_SIZE, x, y, colour, visible)
     r.ImGui_DrawList_PopClipRect(list)
