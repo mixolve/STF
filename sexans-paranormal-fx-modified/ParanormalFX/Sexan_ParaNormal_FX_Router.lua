@@ -175,7 +175,6 @@ CTRL_DRAG_AUTOCONTAINER = false
 TOOLTIPS                = false
 SHOW_C_CONTENT_TOOLTIP  = false
 V_LAYOUT                = true
-CENTER_RESET            = false
 STARTUP_CENTER_RESET    = true
 PENDING_CENTER_RESET    = 0
 SHOW_ADD_FX_ALL_PLUGINS   = true
@@ -234,11 +233,8 @@ if r.HasExtState("PARANORMALFX2", "SETTINGS") then
             CUSTOM_FONT = storedTable.custom_font
             AUTO_COLORING = storedTable.auto_color
             new_spacing_y = storedTable.spacing
-            ZOOM_MAX = storedTable.zoom_max and storedTable.zoom_max or 1
-            ZOOM_DEFAULT = storedTable.zoom_default and storedTable.zoom_default or 1
             ADD_BTN_H = storedTable.add_btn_h
             ADD_BTN_W = storedTable.add_btn_w
-            CENTER_RESET = storedTable.center_reset ~= nil and storedTable.center_reset or CENTER_RESET
             SHOW_ADD_FX_ALL_PLUGINS = StoredBool(storedTable.show_add_fx_all_plugins, SHOW_ADD_FX_ALL_PLUGINS)
             SHOW_ADD_FX_CATEGORY = StoredBool(storedTable.show_add_fx_category, SHOW_ADD_FX_CATEGORY)
             SHOW_ADD_FX_DEVELOPER = StoredBool(storedTable.show_add_fx_developer, SHOW_ADD_FX_DEVELOPER)
@@ -297,10 +293,8 @@ function StoreToPEXT(last_target)
     if not last_target then return end
     local storedTable = {}
     if r.ValidatePtr(last_target, "MediaTrack*") then
-        storedTable.CANVAS = CANVAS
         storedTable.CONTAINERS = GetTRContainerData()
     elseif r.ValidatePtr(last_target, "MediaItem_Take*") then
-        storedTable.CANVAS = CANVAS
         storedTable.CONTAINERS = GetTRContainerData()
     end
     local serialized = tableToString(storedTable)
@@ -323,7 +317,6 @@ end
 
 function RestoreFromPEXT(mode)
     local rv, stored
-    local reset_restored_view = CENTER_RESET or STARTUP_CENTER_RESET
     if mode == "TRACK" and r.ValidatePtr(TRACK, "MediaTrack*") then
         rv, stored = r.GetSetMediaTrackInfo_String(TRACK, "P_EXT:PARANORMAL_FX2", "", false)
     elseif mode == "ITEM" and r.ValidatePtr(TAKE, "MediaItem_Take*") then
@@ -333,13 +326,13 @@ function RestoreFromPEXT(mode)
         local storedTable = stringToTable(stored)
         if storedTable ~= nil then
             if mode == "TRACK" and r.ValidatePtr(TRACK, "MediaTrack*") then
-                CANVAS = storedTable.CANVAS
+                CANVAS = InitCanvas()
                 SetTRContainerData(storedTable.CONTAINERS)
-                if reset_restored_view and CANVAS then QueueCenterReset() end
+                QueueCenterReset()
             elseif mode == "ITEM" and r.ValidatePtr(TAKE, "MediaItem_Take*") then
-                CANVAS = storedTable.CANVAS
+                CANVAS = InitCanvas()
                 SetTRContainerData(storedTable.CONTAINERS)
-                if reset_restored_view and CANVAS then QueueCenterReset() end
+                QueueCenterReset()
             end
             STARTUP_CENTER_RESET = false
             return true
@@ -698,7 +691,6 @@ local function Main()
             StoreToPEXT(TAKE)
             MODE = "TRACK"
             API = track_api
-            ClearExtState()
             UpdateTarget()
             RestoreFromPEXT(MODE)
         end
@@ -707,7 +699,6 @@ local function Main()
             StoreToPEXT(TRACK)
             MODE = "ITEM"
             API = take_api
-            ClearExtState()
             UpdateTarget()
             RestoreFromPEXT(MODE)
         end

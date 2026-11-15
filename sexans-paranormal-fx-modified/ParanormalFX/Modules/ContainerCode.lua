@@ -6,6 +6,59 @@ local TR_CONTAINERS = {}
 
 CLIPBOARD = {}
 
+-- Resolve against the source chain, independently of the visible TRACK/ITEM mode.
+function GetClipboardSource()
+    if CLIPBOARD.take_guid and not CLIPBOARD.take then return end
+    local source = CLIPBOARD.take or CLIPBOARD.track
+    local kind = CLIPBOARD.take and "TakeFX_" or "TrackFX_"
+    local ptr_type = CLIPBOARD.take and "MediaItem_Take*" or "MediaTrack*"
+    if not source or not r.ValidatePtr(source, ptr_type) then return end
+    local get_guid = r[kind .. "GetFXGUID"]
+    local get_config = r[kind .. "GetNamedConfigParm"]
+    local function find(ids)
+        for i, id in ipairs(ids) do
+            if get_guid(source, id) == CLIPBOARD.guid then
+                return id, ids[i + 1]
+            end
+            local ok, count = get_config(source, id, "container_count")
+            if ok then
+                local children = {}
+                for child = 0, tonumber(count) - 1 do
+                    local found, child_id = get_config(source, id, "container_item." .. child)
+                    if found then children[#children + 1] = tonumber(child_id) end
+                end
+                local found, next_id = find(children)
+                if found then return found, next_id end
+            end
+        end
+    end
+    local ids = {}
+    for i = 0, r[kind .. "GetCount"](source) - 1 do ids[#ids + 1] = i end
+    local id, next_id = find(ids)
+    if id == nil then return end
+    CLIPBOARD.id = id
+    return source, kind, next_id
+end
+
+local function CopyClipboardFX(source, src_id, dest_id, is_move)
+    local prefix = CLIPBOARD.take and "TakeFX_" or "TrackFX_"
+    local suffix = MODE == "ITEM" and "CopyToTake" or "CopyToTrack"
+    r[prefix .. suffix](source, src_id, TARGET, dest_id, is_move)
+end
+
+local function PrepareClipboardMove(source, kind, next_id, parallel)
+    local get = r[kind .. "GetNamedConfigParm"]
+    local set = r[kind .. "SetNamedConfigParm"]
+    if next_id then
+        local _, next_parallel = get(source, next_id, "parallel")
+        if next_parallel ~= "0" then
+            local _, current_parallel = get(source, CLIPBOARD.id, "parallel")
+            set(source, next_id, "parallel", current_parallel)
+        end
+    end
+    set(source, CLIPBOARD.id, "parallel", parallel)
+end
+
 function GetFx(guid)
     return FX_DATA[guid]
 end
@@ -435,7 +488,7 @@ function CopyTargetsToNewContainer(track, tbl, i, src_guid, src_i, is_cut)
     end
 
     -- COPY SOURCE FX INTO IT CONTAINER
-    API.CopyToTrack(track, src_id, TARGET, cont_id, is_move)
+    CopyClipboardFX(track, src_id, cont_id, is_move)
     -- SET COPY PARRALEL INFO 0 SINCE IT WILL BE IN SERIAL
     API.SetNamedConfigParm(TARGET, cont_id, "parallel", "0")
 
@@ -589,15 +642,16 @@ function UpdateClipboardInfo()
         return
     end
     -- DONT RECALCULATE IF PASTING ON DIFFERENT TARGET
-    if MODE == "TRACK" and CLIPBOARD.track ~= TRACK then
-        return
-    end
-    if MODE == "ITEM" and CLIPBOARD.take ~= TARGET then
+    if (CLIPBOARD.take or CLIPBOARD.track) ~= TARGET then
         return
     end
 
     UpdateFxData()
     local updated = GetFx(CLIPBOARD.tbl[CLIPBOARD.i].guid)
+    if not updated then
+        ClearExtState()
+        return
+    end
     local parrent = GetFx(updated.pid)
 
     local item_id = CalcFxID(parrent, updated.IDX)
@@ -607,18 +661,6 @@ end
 local old_copy_id
 
 function ClipBoard()
-    local x, y = r.ImGui_GetContentRegionMax(ctx)
-    r.ImGui_SetCursorPos(ctx, 5, y - 30)
-    -- NIFTY HACK FOR COMMENT BOX NOT OVERLAP UI BUTTONS
-    local overlay_flags = r.ImGui_WindowFlags_NoInputs()
-        | r.ImGui_WindowFlags_NoBackground()
-        | r.ImGui_WindowFlags_NoScrollbar()
-        | r.ImGui_WindowFlags_NoScrollWithMouse()
-    if not r.ImGui_BeginChild(ctx, "hack44", -FLT_MIN, -FLT_MIN, false, overlay_flags) then
-        return
-    end
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ChildBg(), 0x222222FF)
-
     if r.HasExtState("PARANORMALFX2", "COPY_BUFFER") then
         local copy_id = r.GetExtState("PARANORMALFX2", "COPY_BUFFER_ID")
         if old_copy_id ~= copy_id then
@@ -637,6 +679,7 @@ function ClipBoard()
                         P_TYPE = storedTable.parrent_TYPE,
                         collapsed = storedTable.collapsed,
                         type = storedTable.type,
+                        take_guid = storedTable.take_guid,
                         take = storedTable.take_guid and r.GetMediaItemTakeByGUID(0, storedTable.take_guid),
                     }
                     for i = 0, r.CountTracks(0) do
@@ -653,33 +696,32 @@ function ClipBoard()
     end
 
     if CLIPBOARD.tbl then
-        if
-            CLIPBOARD.track and r.ValidatePtr(CLIPBOARD.track, "MediaTrack*")
-            or CLIPBOARD.take and r.ValidatePtr(CLIPBOARD.take, "MediaItem_Take*")
-        then
-            local size = CalculateItemWH({ name = CLIPBOARD.tbl[CLIPBOARD.i].name }) + 190
-            if r.ImGui_BeginChild(ctx, "CLIPBOARD", size, def_btn_h + s_window_y, 1) then
-                if r.HasExtState("PARANORMALFX2", "COPY_BUFFER") then
-                    if CLIPBOARD.tbl then
-                        local rv, name
-                        if MODE == "TRACK" then
-                            rv, name = r.GetTrackName(CLIPBOARD.track)
-                        else
-                            name = r.GetTakeName(CLIPBOARD.take)
-                        end
-                        r.ImGui_Text(ctx, "CLIPBOARD: " .. name .. " - FX: " .. CLIPBOARD.tbl[CLIPBOARD.i].name)
-                    end
-                else
-                    r.ImGui_Text(ctx, "CLIPBOARD EMPTY ")
-                end
-                r.ImGui_EndChild(ctx)
-            end
-        else
+        if not GetClipboardSource() then
             ClearExtState()
+            return
         end
+        local label = "CLIPBOARD: " .. CLIPBOARD.tbl[CLIPBOARD.i].name
+        local pad_x, pad_y = 8, 5
+        local x, y = r.ImGui_GetContentRegionMax(ctx)
+        local min_x, min_y = r.ImGui_GetWindowContentRegionMin(ctx)
+        local text_w = r.ImGui_CalcTextSize(ctx, label)
+        local width = math.max(1, math.min(text_w + pad_x * 2, x - min_x))
+        local available = math.max(1, width - pad_x * 2)
+        local _, text_h = r.ImGui_CalcTextSize(ctx, label, nil, nil, false, available)
+        local height = text_h + pad_y * 2
+        r.ImGui_SetCursorPos(ctx, min_x, math.max(min_y, y - height))
+        local flags = r.ImGui_WindowFlags_NoScrollbar() | r.ImGui_WindowFlags_NoScrollWithMouse()
+        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ChildBg(), 0x222222FF)
+        r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowPadding(), pad_x, pad_y)
+        if r.ImGui_BeginChild(ctx, "CLIPBOARD", width, height, 1, flags) then
+            r.ImGui_PushTextWrapPos(ctx, available)
+            r.ImGui_Text(ctx, label)
+            r.ImGui_PopTextWrapPos(ctx)
+        end
+        r.ImGui_EndChild(ctx)
+        r.ImGui_PopStyleVar(ctx)
+        r.ImGui_PopStyleColor(ctx)
     end
-    r.ImGui_PopStyleColor(ctx)
-    r.ImGui_EndChild(ctx)
 end
 
 function Paste(replace, parallel, serial, enclose)
@@ -687,6 +729,11 @@ function Paste(replace, parallel, serial, enclose)
         return
     end
 
+    local source, source_kind, next_id = GetClipboardSource()
+    if not source then
+        ClearExtState()
+        return
+    end
     local is_cut = CLIPBOARD.cut and true or false
 
     local para_info = serial and "0" or ""
@@ -695,38 +742,15 @@ function Paste(replace, parallel, serial, enclose)
     local item_id = CalcFxID(parrent_container, (parallel or serial) and RC_DATA.i + 1 or RC_DATA.i)
     r.Undo_BeginBlock()
     r.PreventUIRefresh(1)
+    if is_cut then
+        PrepareClipboardMove(source, source_kind, next_id, para_info)
+    end
     if enclose then
-        if is_cut then
-            CheckSourceNextItemParallel(
-                CLIPBOARD.i,
-                CLIPBOARD.P_TYPE,
-                CLIPBOARD.P_DIFF,
-                CLIPBOARD.P_ID,
-                CLIPBOARD.track
-            )
-            API.SetNamedConfigParm(CLIPBOARD.track, CLIPBOARD.id, "parallel", para_info)
-        end
-        CopyTargetsToNewContainer(CLIPBOARD.track, RC_DATA.tbl, RC_DATA.i, CLIPBOARD.guid, CLIPBOARD.i, is_cut)
+        CopyTargetsToNewContainer(source, RC_DATA.tbl, RC_DATA.i, CLIPBOARD.guid, CLIPBOARD.i, is_cut)
     else
-        if is_cut then
-            CheckSourceNextItemParallel(
-                CLIPBOARD.i,
-                CLIPBOARD.P_TYPE,
-                CLIPBOARD.P_DIFF,
-                CLIPBOARD.P_ID,
-                CLIPBOARD.track
-            )
-            API.SetNamedConfigParm(CLIPBOARD.track, CLIPBOARD.id, "parallel", para_info)
-            --! ADD NEW COLLAPSE DATA IF CONTAINER
-            AddCollapsePASTEData(CLIPBOARD.id)
-        end
-
-        API.CopyToTrack(MODE == "TRACK" and CLIPBOARD.track or CLIPBOARD.take, CLIPBOARD.id, TARGET, item_id, is_cut)
-        if not is_cut then
-            API.SetNamedConfigParm(TARGET, item_id, "parallel", para_info)
-            --! ADD NEW COLLAPSE DATA IF CONTAINER
-            AddCollapsePASTEData(item_id)
-        end
+        CopyClipboardFX(source, CLIPBOARD.id, item_id, is_cut)
+        API.SetNamedConfigParm(TARGET, item_id, "parallel", para_info)
+        AddCollapsePASTEData(item_id)
 
         if replace then
             UpdateFxData()

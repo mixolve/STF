@@ -18,7 +18,7 @@ local function GetResetViewTarget()
         -- Horizontal rows add ItemSpacing before the ROOT rectangle.
         local row_spacing = 0
         if not V_LAYOUT then
-            row_spacing = r.ImGui_GetStyleVar(ctx, r.ImGui_StyleVar_ItemSpacing()) * CANVAS.scale
+            row_spacing = r.ImGui_GetStyleVar(ctx, r.ImGui_StyleVar_ItemSpacing())
         end
         target_x = WX + 8 - MAIN_CANVAS_SCREEN_X - row_spacing
     end
@@ -31,52 +31,14 @@ end
 
 function InitCanvas()
     local init_x, init_y = GetResetViewTarget()
-    return { view_x = 0, view_y = 0, off_x = init_x, off_y = init_y, scale = ZOOM_DEFAULT }
+    return { view_x = 0, view_y = 0, off_x = init_x, off_y = init_y, scale = 1 }
 end
 
-function UpdateScroll()
-    if not TARGET then return end
-    local btn = ImGui.MouseButton_Right()
-    if ImGui.IsMouseDragging(ctx, btn) then
-        ImGui.SetMouseCursor(ctx, ImGui.MouseCursor_ResizeAll())
-        local drag_x, drag_y = ImGui.GetMouseDragDelta(ctx, nil, nil, btn)
-        CANVAS.off_x, CANVAS.off_y = CANVAS.off_x + drag_x, CANVAS.off_y + drag_y
-        ImGui.ResetMouseDragDelta(ctx, btn)
-    end
-end
-
-ZOOM_MIN, ZOOM_MAX, ZOOM_SPEED = 0.2, 1, 1 / 8
-ZOOM_DEFAULT = 1
-
-function round(num) return (num + 0.5) // 1 end
-
-function updateZoom()
-    if not CTRL then return end
-    local WX, WY = r.ImGui_GetWindowPos(ctx)
-    local new_scale = CANVAS.scale + (r.ImGui_GetMouseWheel(ctx) * ZOOM_SPEED)
-    new_scale = math.max(ZOOM_MIN, math.min(ZOOM_MAX, new_scale))
-
-    if new_scale == CANVAS.scale then return end
-
-    local scale_diff = (new_scale / CANVAS.scale)
-    local mouse_x, mouse_y = r.ImGui_GetMousePos(ctx)
-    mouse_x, mouse_y = (mouse_x - WX) - CANVAS.view_x - CANVAS.off_x,
-        (mouse_y - WY) - CANVAS.view_y - CANVAS.off_y
-    local diff_x, diff_y = mouse_x - (mouse_x * scale_diff),
-        mouse_y - (mouse_y * scale_diff)
-    CANVAS.off_x, CANVAS.off_y = (CANVAS.off_x + diff_x),
-        (CANVAS.off_y + diff_y)
-    CANVAS.scale = new_scale
-end
-
-function ResetView(force)
-    local target_x, target_y = GetResetViewTarget()
-    if force then
-        CANVAS.off_x = target_x
-        CANVAS.off_y = target_y
-    else
-        FLUX.to(CANVAS, 0.5, { off_x = target_x, off_y = target_y }):ease("cubicout")
-    end
+-- The routing canvas has one fixed scale and anchor for every target.
+function ResetView()
+    if not CANVAS then return end
+    CANVAS.scale = 1
+    CANVAS.off_x, CANVAS.off_y = GetResetViewTarget()
 end
 
 local function CheckKeys()
@@ -731,8 +693,6 @@ function StoreSettings()
     local data = tableToString(
         {
             v_layout = V_LAYOUT,
-            zoom_max = ZOOM_MAX,
-            zoom_default = ZOOM_DEFAULT,
             show_c_content_tooltips = SHOW_C_CONTENT_TOOLTIP,
             tooltips = TOOLTIPS,
             animated_highlight = ANIMATED_HIGLIGHT,
@@ -754,7 +714,6 @@ function StoreSettings()
             offline_color = COLOR["offline"],
             anim_color = COLOR["sine_anim"],
             background = COLOR["bg"],
-            center_reset = CENTER_RESET,
             show_add_fx_all_plugins = SHOW_ADD_FX_ALL_PLUGINS,
             show_add_fx_category = SHOW_ADD_FX_CATEGORY,
             show_add_fx_developer = SHOW_ADD_FX_DEVELOPER,
@@ -1263,21 +1222,6 @@ function DrawUserSettings()
                 end
                 r.ImGui_EndListBox(ctx)
             end
-            r.ImGui_SetNextItemWidth(ctx, 50)
-            max_zoom_rv, ZOOM_MAX = r.ImGui_SliderInt(ctx, "MAX ZOOM", ZOOM_MAX, 1, 3)
-            r.ImGui_SetNextItemWidth(ctx, 50)
-            zoom_rv, ZOOM_DEFAULT = r.ImGui_SliderInt(ctx, "DEFAULT ZOOM", ZOOM_DEFAULT, 1, ZOOM_MAX)
-            --zoom_rv, ZOOM_DEFAULT = r.ImGui_Slideri( ctx, "DEFAULT ZOOM", ZOOM_DEFAULT, 0.5, 2.0 )
-            if zoom_rv then
-                CANVAS.scale = 0.5 + (0.5 * ZOOM_DEFAULT)
-            end
-            if max_zoom_rv then
-                if ZOOM_MAX < ZOOM_DEFAULT then
-                    ZOOM_DEFAULT = ZOOM_MAX
-                    CANVAS.scale = 0.5 + (0.5 * ZOOM_DEFAULT)
-                end
-            end
-
             r.ImGui_SetNextItemWidth(ctx, 100)
             _, new_spacing_y = r.ImGui_SliderInt(ctx, "SPACING", new_spacing_y, 0, 20)
             r.ImGui_SetNextItemWidth(ctx, 100)
@@ -1327,8 +1271,6 @@ function DrawUserSettings()
             SettingsTooltips("+ || BUTTONS HAVE ANIMATED COLOR\nFOR BETTER VISIBILITY WHEN DRAGGING")
             _, CTRL_DRAG_AUTOCONTAINER = r.ImGui_Checkbox(ctx, "CTRL-DRAG AUTO CONT", CTRL_DRAG_AUTOCONTAINER)
             SettingsTooltips("CTRL-DRAG COPYING FX OVER ANOTHER FX\nWILL ENCLOSE BOTH IN CONT")
-            _, CENTER_RESET = r.ImGui_Checkbox(ctx, "CENTER RESET", CENTER_RESET)
-            SettingsTooltips("RESET/CENTER VIEW ON TRACK CHANGE, SCRIPT START")
 
             if r.ImGui_BeginListBox(ctx, "NEW FX\nDND", nil, new_im_padding) then
                 if r.ImGui_Selectable(ctx, "REPLACE", DEFAULT_DND == true) then
@@ -1356,7 +1298,6 @@ function DrawUserSettings()
 
         if ParaButton(ctx, "DEFAULT") then
             V_LAYOUT = true
-            ZOOM_MAX = 1
             SHOW_C_CONTENT_TOOLTIP = false
             TOOLTIPS = false
             ANIMATED_HIGLIGHT = true
@@ -1371,7 +1312,6 @@ function DrawUserSettings()
             WireThickness = 1
             ADD_BTN_W = 30
             ADD_BTN_H = 30
-            CENTER_RESET = false
             SHOW_ADD_FX_ALL_PLUGINS = true
             SHOW_ADD_FX_CATEGORY = true
             SHOW_ADD_FX_DEVELOPER = true

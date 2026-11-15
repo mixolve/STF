@@ -269,9 +269,7 @@ local function DisplayFxName(fx_name, fx_type)
 end
 
 function ValidateClipboardFX()
-    UpdateFxData()
-    --! MAKE SURE FX IS NOT DELETED BEFORE DOING UPDATE
-    if not GetFx(CLIPBOARD.guid) then
+    if CLIPBOARD.tbl and not GetClipboardSource() then
         ClearExtState()
     end
 end
@@ -3447,12 +3445,11 @@ function Draw()
     if r.ImGui_BeginChild(ctx, "##MAIN", nil, nil, nil, WND_FLAGS) then
         local sx, sy = r.ImGui_GetCursorScreenPos(ctx)
         MAIN_CANVAS_SCREEN_X, MAIN_CANVAS_SCREEN_Y = sx, sy
+        ResetView()
         local x, y = sx + CANVAS.off_x, sy + CANVAS.off_y
         r.ImGui_SetCursorScreenPos(ctx, x, y)
         local inherited_colour = not PLUGINS[0].bypass and COLOR["bypass"] or nil
         DrawVH(x, y, PLUGINS, 1, inherited_colour)
-        UpdateScroll()
-        updateZoom()
         if r.ImGui_IsWindowHovered(ctx, r.ImGui_HoveredFlags_AllowWhenBlockedByPopup()) then
             if not OPEN_FM then
                 if
