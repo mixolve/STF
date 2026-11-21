@@ -224,14 +224,14 @@ std::vector<Box>boxes(){std::vector<Box>out;for(auto&[id,p]:manifest.parents){
  for(auto&[cid,c]:manifest.children)if(c.parent==id){Box cb=b;cb.id=cid;cb.child=true;cb.start+=c.offset;cb.end+=c.offset;out.push_back(cb);}
  }return out;}
 Action actions[]={
- {0,"KKLinkedContainerCopy","Linked containers: Create linked copy at edit cursor",nullptr},
- {0,"KKLinkedContainerParent","Linked containers: Select parent",nullptr},
- {0,"KKLinkedContainerMove","Linked containers: Move selected container to edit cursor",nullptr},
- {0,"KKLinkedContainerDetach","Linked containers: Detach selected child container",nullptr},
- {0,"KKLinkedContainerDelete","Linked containers: Delete selected container",nullptr},
- {0,"KKLinkedContainerAdd","Linked containers: Add selected items to parent container",nullptr},
- {0,"KKLinkedContainerDuplicateNext","Linked containers: Duplicate selected container immediately after itself",nullptr},
- {0,"KKLinkedContainerDeselect","Linked containers: Deselect container",nullptr}};
+ {0,"mixolve_linked_items_copy","mixolve_linked-items: create linked copy at edit cursor",nullptr},
+ {0,"mixolve_linked_items_select_parent","mixolve_linked-items: select parent",nullptr},
+ {0,"mixolve_linked_items_move","mixolve_linked-items: move selected container to edit cursor",nullptr},
+ {0,"mixolve_linked_items_detach","mixolve_linked-items: detach selected child container",nullptr},
+ {0,"mixolve_linked_items_delete","mixolve_linked-items: delete selected container",nullptr},
+ {0,"mixolve_linked_items_add","mixolve_linked-items: add selected items to parent container",nullptr},
+ {0,"mixolve_linked_items_duplicate_next","mixolve_linked-items: duplicate selected container immediately after itself",nullptr},
+ {0,"mixolve_linked_items_deselect","mixolve_linked-items: deselect container",nullptr}};
 constexpr int actionCount=8;
 int commands[actionCount]{};
 void detachItem(const Item&i){writeString(i.ptr,childKey,"");writeString(i.ptr,sourceKey,"");writeString(i.ptr,hashKey,"");writeString(i.ptr,contentKey,"");writeString(i.ptr,payloadKey,"");writeString(i.ptr,"P_EXT:LC2_EXCLUDED","1");SetMediaItemInfo_Value(i.ptr,"C_LOCK",0);SetMediaItemInfo_Value(i.ptr,"I_GROUPID",0);}

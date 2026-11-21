@@ -1,5 +1,5 @@
 /*
-  mixolve_fake-freeze: native REAPER extension, 1.12 (macOS)
+  mixolve_fake-freeze: native REAPER extension, 1.9.1 (macOS)
 
   Uses built-in REAPER action 41719 to render a stereo stem track within the
   exact time selection of the source items without
@@ -18,7 +18,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
-#include <time.h>
 
 #define MFF_RENDER_SELECTED_AREA_STEREO 41719
 #define MFF_MAX_TRACKS 8192
@@ -29,6 +28,7 @@
 #define MFF_SOURCE_KEY "P_EXT:MFF_SOURCE_GUID"
 #define MFF_STEM_KEY   "P_EXT:MFF_STEM_GUID"
 #define MFF_STATE_KEY  "P_EXT:MFF_SAVED_STATE"
+#define MFF_ITEM_LOCK_KEY "P_EXT:MFF_FAKE_FREEZE_ORIG_LOCK"
 #define MFF_PREF_SECTION "MelodyneFakeFreeze"
 #define MFF_TAIL_KEY "TailSeconds"
 
@@ -43,6 +43,8 @@ static bool (*R_SetMediaTrackInfo_Value)(MediaTrack *, const char *, double);
 static int (*R_CountTrackMediaItems)(MediaTrack *);
 static MediaItem *(*R_GetTrackMediaItem)(MediaTrack *, int);
 static double (*R_GetMediaItemInfo_Value)(MediaItem *, const char *);
+static bool (*R_SetMediaItemInfo_Value)(MediaItem *, const char *, double);
+static bool (*R_GetSetMediaItemInfo_String)(MediaItem *, const char *, char *, bool);
 static void (*R_GetSet_LoopTimeRange2)(ReaProject *, bool, bool, double *, double *, bool);
 static void (*R_Main_OnCommand)(int, int);
 static int (*R_GetPlayState)(void);
@@ -67,57 +69,19 @@ static void (*R_TrackFX_SetOffline)(MediaTrack *, int, bool);
 static int (*R_TrackFX_GetChainVisible)(MediaTrack *);
 static void (*R_TrackFX_Show)(MediaTrack *, int, int);
 static bool (*R_ValidatePtr2)(ReaProject *, void *, const char *);
-/* Native TCP F/LI integration, carried over from mixolve_custom-view/freeze.cpp. */
-static ReaProject *(*R_EnumProjects)(int, char *, int);
-static MediaTrack *(*R_GetMasterTrack)(ReaProject *);
-static MediaTrack *(*R_GetTrackFromPoint)(int, int, int *);
-static void (*R_GetMousePosition)(int *, int *);
-static bool (*R_IsTrackSelected)(MediaTrack *);
-static void (*R_SetOnlyTrackSelected)(MediaTrack *);
-static bool (*R_SetMediaItemInfo_Value)(MediaItem *, const char *, double);
-static const char *(*R_GetLastColorThemeFile)(void);
-static const char *(*R_GetResourcePath)(void);
-static bool (*R_ThemeLayout_GetLayout)(const char *, int, char *, int);
-
-/* Implemented by mixolve_fake_freeze_tcp.m, built into the same .dylib. */
-extern void MFF_TCP_Start(void);
-extern void MFF_TCP_Stop(void);
-extern void MFF_TCP_ButtonClickNoted(void);
-
-
 static int (*plugin_register_saved)(const char *, void *);
 static int g_toggle_action_id;
 static int g_tail_action_id;
-static int g_tcp_freeze_action_id;
-static int g_tcp_items_lock_action_id;
-static bool g_tcp_button_busy;
-static bool g_layout_updating;
-static double g_last_layout_scan;
-static double g_last_theme_probe;
-static bool g_theme_supported;
-static char g_probed_theme[1024];
-static MediaTrack *g_tcp_selected[MFF_MAX_TRACKS];
 static bool g_in_action;
 
 static custom_action_register_t g_toggle_action = {
-    0, "MFF_MELODYNE_FAKE_FREEZE_TOGGLE",
-    "mixolve: Fake Freeze / Unfreeze (ARA-safe stem)", NULL
+    0, "MIXOLVE_FAKE_FREEZE_TOGGLE",
+    "mixolve_fake-freeze: fake freeze / unfreeze (ara-safe stem)", NULL
 };
 static custom_action_register_t g_tail_action = {
-    0, "MFF_MELODYNE_SET_FREEZE_TAIL",
-    "mixolve: Set Fake Freeze tail (seconds) [project]", NULL
+    0, "MIXOLVE_FAKE_FREEZE_SET_TAIL",
+    "mixolve_fake-freeze: set fake freeze tail (seconds) [project]", NULL
 };
-/* These names are referenced by the user's existing WALTER theme.
-   They must be registered as actual Main-section custom actions, rather than
-   bare command_id records: the theme dispatches real actions by those IDs.
-   Keeping the exact IDs avoids any theme edits. */
-static custom_action_register_t g_tcp_freeze_action = {
-    0, "MIXOLVE_TCP_FREEZE_TOGGLE", "mixolve: TCP button F (Fake Freeze)", NULL
-};
-static custom_action_register_t g_tcp_items_lock_action = {
-    0, "MIXOLVE_TCP_ITEMS_LOCK_TOGGLE", "mixolve: TCP button LI (Lock items)", NULL
-};
-
 typedef struct ActionTask {
     char origin_guid[MFF_GUID_SZ];
     char stem_guid[MFF_GUID_SZ];
@@ -410,6 +374,188 @@ static bool restore_state(MediaTrack *src) {
     return true;
 }
 
+/* REAPER's C_LOCK is a bit field: bit 0 means locked. Retain all other
+   bits, restoring the exact original value on Unfreeze. Persistent P_EXT item
+   data stores original values across REAPER sessions. */
+static char g_lock_error[192];
+
+static void lock_error(const char *stage, int item_index) {
+    if (item_index >= 0)
+        snprintf(g_lock_error, sizeof(g_lock_error),
+                 "Could not restore item %d locks (%s); stem was not deleted.",
+                 item_index + 1, stage);
+    else
+        snprintf(g_lock_error, sizeof(g_lock_error),
+                 "Could not restore original item locks (%s); stem was not deleted.",
+                 stage);
+}
+
+static bool item_lock_flags(MediaItem *item, int *flags) {
+    if (!item || !flags) return false;
+    double value = R_GetMediaItemInfo_Value(item, "C_LOCK");
+    if (!isfinite(value) || value < -128 || value > 255 || value != (int)value)
+        return false;
+    *flags = (int)value;
+    return true;
+}
+
+/* REAPER P_EXT setter return values alone cannot establish whether the
+   requested change took effect. In particular, clearing an ext field with
+   an empty string can return false even when the field is now empty.
+   Always inspect the value returned by a new GET instead. */
+static bool write_item_snapshot(MediaItem *item, const char *value) {
+    if (!item || !value) return false;
+    char written[MFF_STR_SZ];
+    size_t n = strlen(value);
+    if (n >= sizeof(written)) return false;
+    memcpy(written, value, n + 1);
+    (void)R_GetSetMediaItemInfo_String(item, MFF_ITEM_LOCK_KEY, written, true);
+    char check[MFF_STR_SZ] = {0};
+    (void)R_GetSetMediaItemInfo_String(item, MFF_ITEM_LOCK_KEY, check, false);
+    check[sizeof(check) - 1] = 0;
+    return strcmp(check, value) == 0;
+}
+
+/* A setter may report false despite applying a lock change. A readback is
+   what determines whether continuing (or deleting a linked stem) is safe. */
+static bool write_item_lock(MediaItem *item, int flags) {
+    if (!item) return false;
+    (void)R_SetMediaItemInfo_Value(item, "C_LOCK", (double)flags);
+    int actual = 0;
+    return item_lock_flags(item, &actual) && actual == flags;
+}
+
+static bool read_item_lock_snapshot(MediaItem *item, const char *track_guid,
+                                    int *original, bool *found) {
+    if (!item || !track_guid || !original || !found) return false;
+    char buf[MFF_STR_SZ] = {0};
+    bool ok = R_GetSetMediaItemInfo_String(item, MFF_ITEM_LOCK_KEY, buf, false);
+    buf[sizeof(buf) - 1] = 0;
+    if (!ok && buf[0]) return false;
+    char prefix[MFF_GUID_SZ + 8];
+    int len = snprintf(prefix, sizeof(prefix), "v1;%s;", track_guid);
+    if (len <= 0 || (size_t)len >= sizeof(prefix)) return false;
+    if (strncmp(buf, prefix, (size_t)len) != 0) {
+        *found = false;
+        return true; /* Older frozen projects or items added since Freeze. */
+    }
+    int lock = 0, consumed = 0;
+    if (sscanf(buf + len, "%d%n", &lock, &consumed) != 1 ||
+        consumed <= 0 || buf[len + consumed] != 0 ||
+        lock < -128 || lock > 255)
+        return false;
+    *original = lock;
+    *found = true;
+    return true;
+}
+
+/* Prevalidate before changing ANY lock flags. Newly created items without
+   a matching snapshot keep their current lock state. */
+static bool validate_item_lock_snapshots(MediaTrack *track) {
+    char guid[MFF_GUID_SZ];
+    if (!get_guid(track, guid)) return false;
+    int n = R_CountTrackMediaItems(track);
+    if (n < 0) return false;
+    for (int i = 0; i < n; ++i) {
+        MediaItem *item = R_GetTrackMediaItem(track, i);
+        int original = 0, current = 0;
+        bool found = false;
+        if (!item || !item_lock_flags(item, &current) ||
+            !read_item_lock_snapshot(item, guid, &original, &found))
+            return false;
+    }
+    return true;
+}
+
+/* Restore original lock values, then remove their snapshots. Every mutation
+   is read back before allowing stem deletion. If a genuine write fails,
+   keep the stem and surviving metadata so Unfreeze can be retried safely. */
+static bool restore_item_locks(MediaTrack *track) {
+    g_lock_error[0] = 0;
+    if (!validate_item_lock_snapshots(track)) {
+        lock_error("invalid saved item data", -1);
+        return false;
+    }
+    char guid[MFF_GUID_SZ];
+    if (!get_guid(track, guid)) {
+        lock_error("missing track GUID", -1);
+        return false;
+    }
+    int n = R_CountTrackMediaItems(track);
+    for (int i = 0; i < n; ++i) {
+        MediaItem *item = R_GetTrackMediaItem(track, i);
+        int original = 0;
+        bool found = false;
+        if (!read_item_lock_snapshot(item, guid, &original, &found)) {
+            lock_error("invalid lock snapshot", i);
+            return false;
+        }
+        int current = 0;
+        if (found && (!item_lock_flags(item, &current) ||
+                      (current != original && !write_item_lock(item, original)))) {
+            lock_error("C_LOCK write/readback failed", i);
+            return false;
+        }
+    }
+    /* All required lock flags were restored. Clear only snapshots belonging
+       to this source track. An empty P_EXT setter return is not an error if
+       a following getter confirms that the value is empty. */
+    for (int i = 0; i < n; ++i) {
+        MediaItem *item = R_GetTrackMediaItem(track, i);
+        int original = 0;
+        bool found = false;
+        if (!read_item_lock_snapshot(item, guid, &original, &found)) {
+            lock_error("snapshot read during cleanup failed", i);
+            return false;
+        }
+        if (found && !write_item_snapshot(item, "") &&
+            !write_item_snapshot(item, "v2;restored")) {
+            /* Some REAPER builds may reject empty P_EXT writes. A verified
+               nonempty sentinel is equivalent: it cannot be interpreted as
+               an active lock snapshot and a later Freeze can overwrite it. */
+            lock_error("snapshot cleanup/readback failed", i);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool lock_track_items(MediaTrack *track) {
+    char guid[MFF_GUID_SZ];
+    if (!get_guid(track, guid)) return false;
+    int n = R_CountTrackMediaItems(track);
+    if (n <= 0) return false;
+    /* Reject stale snapshots rather than overwriting an original value. */
+    for (int i = 0; i < n; ++i) {
+        MediaItem *item = R_GetTrackMediaItem(track, i);
+        int original = 0, current = 0;
+        bool found = false;
+        if (!item || !item_lock_flags(item, &current) ||
+            !read_item_lock_snapshot(item, guid, &original, &found) || found)
+            return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        MediaItem *item = R_GetTrackMediaItem(track, i);
+        int original = 0;
+        char state[MFF_GUID_SZ + 32];
+        if (!item_lock_flags(item, &original)) goto rollback;
+        int len = snprintf(state, sizeof(state), "v1;%s;%d", guid, original);
+        if (len <= 0 || (size_t)len >= sizeof(state) ||
+            !write_item_snapshot(item, state) ||
+            !write_item_lock(item, original | 1))
+            goto rollback;
+    }
+    for (int i = 0; i < n; ++i) {
+        int current = 0;
+        if (!item_lock_flags(R_GetTrackMediaItem(track, i), &current) ||
+            !(current & 1)) goto rollback;
+    }
+    return true;
+rollback:
+    (void)restore_item_locks(track);
+    return false;
+}
+
 /* Compute the occupied region, including gaps. Caller extends the end by the
    user-requested tail; REAPER may append additional render tails if enabled. */
 static bool item_time_bounds(MediaTrack *src, double *out_start, double *out_end) {
@@ -461,28 +607,6 @@ static bool deactivate_fx_after_freeze(MediaTrack *src) {
                   R_TrackFX_GetEnabled(src, 0))) return false;
     for (int i = 1; i < n; ++i)
         if (!R_TrackFX_GetOffline(src, i)) return false;
-    return true;
-}
-
-/* Activate LI on the *rendered stem* by locking every rendered item.
-   Preserve all other C_LOCK flags, and leave source item states unchanged.
-   TCP's layout updater reads this lock bit and shows LI as active. */
-static bool lock_rendered_stem_items(MediaTrack *stem) {
-    int n = R_CountTrackMediaItems(stem);
-    if (n <= 0) return false;
-    for (int i = 0; i < n; ++i) {
-        MediaItem *item = R_GetTrackMediaItem(stem, i);
-        if (!item) return false;
-        int flags = (int)R_GetMediaItemInfo_Value(item, "C_LOCK");
-        if (!(flags & 1) &&
-            !R_SetMediaItemInfo_Value(item, "C_LOCK", (double)(flags | 1)))
-            return false;
-    }
-    for (int i = 0; i < n; ++i) {
-        MediaItem *item = R_GetTrackMediaItem(stem, i);
-        if (!item || !((int)R_GetMediaItemInfo_Value(item, "C_LOCK") & 1))
-            return false;
-    }
     return true;
 }
 
@@ -558,10 +682,10 @@ static const char *do_freeze(MediaTrack *src, double tail_seconds, MediaTrack **
         return "Cannot read rendered stem GUID; orphan render was left untouched.";
     }
 
-    /* Preserve exactly the source track name: no [FROZEN] suffix. */
+    /* Keep the source track name without a generated freeze suffix. */
     char name[MFF_STR_SZ];
     get_string(src, "P_NAME", name, sizeof(name));
-    set_string(stem, "P_NAME", name);
+    set_string(stem, "P_NAME", name[0] ? name : "Track");
     int color = R_GetTrackColor(src);
     if (color) R_SetTrackColor(stem, color);
     if (height_px > 0) {
@@ -569,15 +693,6 @@ static const char *do_freeze(MediaTrack *src, double tail_seconds, MediaTrack **
         R_SetMediaTrackInfo_Value(stem, "B_HEIGHTLOCK", 0);
         R_SetMediaTrackInfo_Value(stem, "I_HEIGHTOVERRIDE", height_px);
         R_SetMediaTrackInfo_Value(stem, "B_HEIGHTLOCK", height_locked);
-    }
-
-    /* Unlike native Freeze, render-stem items start unlocked. Lock them now
-       so the existing TCP LI button displays its active state immediately
-       after the next layout refresh. The original items remain untouched. */
-    if (!lock_rendered_stem_items(stem)) {
-        restore_state(src);
-        set_string(src, MFF_STATE_KEY, "");
-        return "Could not lock rendered stem items; source restored, render left untouched.";
     }
 
     if (!set_string(src, MFF_STEM_KEY, stem_guid) ||
@@ -596,6 +711,20 @@ static const char *do_freeze(MediaTrack *src, double tail_seconds, MediaTrack **
         restore_state(src);
         set_string(src, MFF_STATE_KEY, "");
         return "Could not set FX bypass/offline; source restored and stem left untouched.";
+    }
+    /* Lock both the retained source items and the visible rendered stem.
+       On failure restore both sets of locks and undo the source-state change;
+       the unlinked rendered track is left in the project for inspection. */
+    bool source_items_locked = lock_track_items(src);
+    bool stem_items_locked = source_items_locked && lock_track_items(stem);
+    if (!source_items_locked || !stem_items_locked) {
+        /* A failed lock_track_items() already rolls back its own writes. */
+        if (source_items_locked) restore_item_locks(src);
+        set_string(src, MFF_STEM_KEY, "");
+        set_string(stem, MFF_SOURCE_KEY, "");
+        restore_state(src);
+        set_string(src, MFF_STATE_KEY, "");
+        return "Could not lock the source/stem items; source restored, render kept.";
     }
     R_SetMediaTrackInfo_Value(src, "B_MUTE", 1);
     R_SetMediaTrackInfo_Value(src, "B_SHOWINTCP", 0);
@@ -618,19 +747,14 @@ static const char *do_unfreeze(MediaTrack *source, MediaTrack *stem, MediaTrack 
     char state[MFF_STR_SZ];
     get_string(source, MFF_STATE_KEY, state, sizeof(state));
     if (!state[0]) return "Saved source state missing; nothing deleted.";
-
-    /* The rendered track is the user's visible, editable name while frozen.
-       Read it before deleting the stem, and transfer it to the original only
-       after the linked tracks and saved source state have been validated.
-       An empty name is valid (an unnamed track). */
-    char stem_name[MFF_STR_SZ];
-    if (!get_string(stem, "P_NAME", stem_name, sizeof(stem_name)))
-        return "Could not read frozen track name; nothing deleted.";
+    if (!validate_item_lock_snapshots(source))
+        return "Saved item lock state invalid; nothing deleted.";
     if (!restore_state(source)) return "Saved source state invalid; nothing deleted.";
-    if (!set_string(source, "P_NAME", stem_name))
-        return "Could not synchronize frozen track name; stem was not deleted.";
+    if (!restore_item_locks(source))
+        return g_lock_error[0] ? g_lock_error :
+               "Could not restore original item locks; stem was not deleted.";
 
-    /* Only now that restoration and name sync succeeded do we delete the stem. */
+    /* Only now that restoration succeeded do we delete the linked stem. */
     set_string(source, MFF_STEM_KEY, "");
     set_string(source, MFF_STATE_KEY, "");
     R_DeleteTrack(stem);
@@ -741,228 +865,11 @@ static bool run_toggle(void) {
     return true;
 }
 
-/* All state/layout logic below was ported from the supplied custom-view
-   freeze.cpp. Unlike native I_FREEZECOUNT, F now watches our GUID-linked stem. */
-static double tcp_clock(void) {
-    struct timespec t = {0, 0};
-    return clock_gettime(CLOCK_MONOTONIC, &t) == 0
-         ? (double)t.tv_sec + (double)t.tv_nsec / 1000000000.0 : 0;
-}
-
-static bool tcp_strip(char *s, const char *prefix) {
-    size_t n = strlen(prefix);
-    if (strncmp(s, prefix, n)) return false;
-    memmove(s, s + n, strlen(s + n) + 1);
-    return true;
-}
-
-static bool tcp_supported_base(const char *name) {
-    if (!name[0]) return true;
-    static const char *sizes[] = {"", "50%_", "75%_", "150%_", "200%_", "default_"};
-    for (int i = 0; i < 6; ++i) {
-        for (char letter = 'A'; letter <= 'C'; ++letter) {
-            char variant[40];
-            snprintf(variant, sizeof(variant), "%s%c", sizes[i], letter);
-            if (!strcmp(name, variant)) return true;
-        }
-    }
-    return false;
-}
-
-static bool tcp_theme_supported(double now) {
-    const char *theme = R_GetLastColorThemeFile();
-    const char *res = R_GetResourcePath();
-    if (!theme || !res) return false;
-    char expected_a[1024], expected_b[1024];
-    snprintf(expected_a, sizeof(expected_a), "%s/ColorThemes/deftweaked.ReaperTheme", res);
-    snprintf(expected_b, sizeof(expected_b), "%s/ColorThemes/Default_7.0.ReaperThemeZip", res);
-    if (!strcmp(theme, expected_a) || !strcmp(theme, expected_b)) return true;
-    if (strcmp(theme, g_probed_theme) || now - g_last_theme_probe >= 1.0) {
-        snprintf(g_probed_theme, sizeof(g_probed_theme), "%s", theme);
-        g_last_theme_probe = now;
-        bool frozen = false, locked = false, closed = false;
-        for (int i = 0; i < 4096; ++i) {
-            char name[1024] = {0};
-            if (!R_ThemeLayout_GetLayout("tcp", i, name, (int)sizeof(name))) break;
-            if (!strcmp(name, "CharonFrozen_default_A")) frozen = true;
-            if (!strcmp(name, "CharonItemsLocked_default_A")) locked = true;
-            if (!strcmp(name, "CharonClosed_default_A")) closed = true;
-            if (frozen && locked && closed) break;
-        }
-        g_theme_supported = frozen && locked && closed;
-    }
-    return g_theme_supported;
-}
-
-static bool tcp_is_fake_frozen(MediaTrack *track) {
-    char guid[MFF_GUID_SZ] = {0};
-    return (get_string(track, MFF_SOURCE_KEY, guid, sizeof(guid)) && guid[0] == '{') ||
-           (get_string(track, MFF_STEM_KEY, guid, sizeof(guid)) && guid[0] == '{');
-}
-
-/* REAPER calls the registered "timer" callback on the main thread. */
-static void tcp_update_layouts(void) {
-    if (g_tcp_button_busy || g_in_action || g_layout_updating) return;
-    double now = tcp_clock();
-    if (now - g_last_layout_scan < 0.05) return;
-    g_last_layout_scan = now;
-    ReaProject *owner = R_EnumProjects(-1, NULL, 0);
-    if (!owner || !R_GetResourcePath() || !R_GetLastColorThemeFile()) return;
-    bool supported = tcp_theme_supported(now);
-    char default_name[1024] = {0};
-    R_ThemeLayout_GetLayout("tcp", -1, default_name, (int)sizeof(default_name));
-    size_t len = strlen(default_name);
-    char letter = len && default_name[len - 1] >= 'A' && default_name[len - 1] <= 'C'
-                ? default_name[len - 1] : 'A';
-
-    g_layout_updating = true;
-    bool changed = false;
-    int count = R_CountTracks(owner);
-    for (int i = 0; i < count; ++i) {
-        MediaTrack *track = R_GetTrack(owner, i);
-        char old[1024] = {0}, base[1024] = {0};
-        if (!get_string(track, "P_TCP_LAYOUT", old, sizeof(old))) continue;
-        snprintf(base, sizeof(base), "%s", old);
-        bool was_locked = tcp_strip(base, "CharonItemsLocked_");
-        bool was_frozen = tcp_strip(base, "CharonFrozen_");
-        bool was_closed = tcp_strip(base, "CharonClosed_");
-        if (!tcp_supported_base(base)) continue; /* Respect unrelated custom layouts. */
-        if ((was_locked || was_frozen || was_closed) && !strncmp(base, "default_", 8))
-            base[0] = 0;
-        bool closed = supported && (int)R_GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH") == 1 &&
-                      R_GetMediaTrackInfo_Value(track, "I_FOLDERCOMPACT") > 0;
-        bool frozen = supported && tcp_is_fake_frozen(track);
-        bool locked = false;
-        if (supported) {
-            int items = R_CountTrackMediaItems(track);
-            locked = items > 0;
-            for (int j = 0; j < items && locked; ++j) {
-                MediaItem *item = R_GetTrackMediaItem(track, j);
-                locked = item && (((int)R_GetMediaItemInfo_Value(item, "C_LOCK")) & 1);
-            }
-        }
-        char wanted[1024] = {0};
-        const char *stem = base;
-        char default_variant[24];
-        if (closed || frozen || locked) {
-            if (!base[0]) {
-                snprintf(default_variant, sizeof(default_variant), "default_%c", letter);
-                stem = default_variant;
-            }
-        }
-        snprintf(wanted, sizeof(wanted), "%s%s%s%s",
-                 locked ? "CharonItemsLocked_" : "",
-                 frozen ? "CharonFrozen_" : "",
-                 closed ? "CharonClosed_" : "", stem);
-        if (strcmp(old, wanted) && set_string(track, "P_TCP_LAYOUT", wanted)) changed = true;
-    }
-    if (changed) {
-        R_TrackList_AdjustWindows(false);
-        R_UpdateArrange();
-    }
-    g_layout_updating = false;
-}
-
-static MediaTrack *tcp_target_track(ReaProject *owner) {
-    int x = 0, y = 0;
-    R_GetMousePosition(&x, &y);
-    MediaTrack *track = R_GetTrackFromPoint(x, y, NULL);
-    if (!track) track = R_GetSelectedTrack(owner, 0);
-    if (!track || track == R_GetMasterTrack(owner) || !R_ValidatePtr2(owner, track, "MediaTrack*"))
-        return NULL;
-    return track;
-}
-
-/* LI is read-only while Fake Freeze is active: its stem items are locked
-   by do_freeze(), and clicking LI must never unlock them. The hidden original
-   is guarded as well, so accidental mouse targeting cannot change its locks.
-   This affects our TCP LI action only, not REAPER's built-in lock commands. */
-static void tcp_toggle_item_locks(ReaProject *owner, MediaTrack *track) {
-    if (tcp_is_fake_frozen(track)) return;
-    int n = R_CountTrackMediaItems(track);
-    if (n <= 0) return;
-    bool all_locked = true;
-    for (int i = 0; i < n; ++i) {
-        MediaItem *item = R_GetTrackMediaItem(track, i);
-        if (!item || !(((int)R_GetMediaItemInfo_Value(item, "C_LOCK")) & 1)) {
-            all_locked = false;
-            break;
-        }
-    }
-    R_Undo_BeginBlock2(owner);
-    for (int i = 0; i < n; ++i) {
-        MediaItem *item = R_GetTrackMediaItem(track, i);
-        if (!item) continue;
-        int flags = (int)R_GetMediaItemInfo_Value(item, "C_LOCK");
-        int requested = all_locked ? (flags & ~1) : (flags | 1);
-        if (requested != flags) R_SetMediaItemInfo_Value(item, "C_LOCK", (double)requested);
-    }
-    R_Undo_EndBlock2(owner, all_locked ? "mixolve: Unlock track items" : "mixolve: Lock track items", 4);
-    R_UpdateArrange();
-}
-
-/* F uses the fake-freeze engine, one mouse-targeted track only; it preserves
-   the user's selection just as the original custom-view button did. */
-static bool tcp_button_command(bool is_lock) {
-    if (g_tcp_button_busy || g_in_action) return true;
-    ReaProject *owner = R_EnumProjects(-1, NULL, 0);
-    if (!owner) return true;
-    MediaTrack *track = tcp_target_track(owner);
-    if (!track) return true;
-    MFF_TCP_ButtonClickNoted();
-    g_tcp_button_busy = true;
-    if (is_lock) {
-        tcp_toggle_item_locks(owner, track);
-    } else {
-        int saved_count = 0;
-        int tracks = R_CountTracks(owner);
-        for (int i = 0; i < tracks && saved_count < MFF_MAX_TRACKS; ++i) {
-            MediaTrack *candidate = R_GetTrack(owner, i);
-            if (candidate && R_IsTrackSelected(candidate)) g_tcp_selected[saved_count++] = candidate;
-        }
-        MediaTrack *master = R_GetMasterTrack(owner);
-        bool master_selected = master && R_IsTrackSelected(master);
-        if (master) R_SetTrackSelected(master, false);
-        clear_selection();
-        R_SetTrackSelected(track, true);
-        run_toggle();
-        /* Rendering may have removed the original stem and changed track count.
-           Only restore pointers known to be valid in the SAME open project. */
-        bool same_open = false;
-        for (int i = 0; ; ++i) {
-            ReaProject *candidate = R_EnumProjects(i, NULL, 0);
-            if (!candidate) break;
-            if (candidate == owner) { same_open = true; break; }
-        }
-        if (same_open) {
-            int current_count = R_CountTracks(owner);
-            for (int i = 0; i < current_count; ++i)
-                R_SetTrackSelected(R_GetTrack(owner, i), false);
-            if (master && R_ValidatePtr2(owner, master, "MediaTrack*"))
-                R_SetTrackSelected(master, master_selected);
-            for (int i = 0; i < saved_count; ++i)
-                if (R_ValidatePtr2(owner, g_tcp_selected[i], "MediaTrack*"))
-                    R_SetTrackSelected(g_tcp_selected[i], true);
-            R_UpdateArrange();
-        }
-    }
-    g_tcp_button_busy = false;
-    g_last_layout_scan = 0;
-    g_last_theme_probe = 0;
-    g_probed_theme[0] = 0;
-    tcp_update_layouts();
-    return true;
-}
-
-/* hookcommand runs for all Main-section commands, including WALTER
-   custom buttons clicked with the mouse. hookcommand2 is only for actions
-   triggered by key/MIDI events and does not cover these mouse clicks. */
-static bool hook_command(int command, int flag) {
-    (void)flag;
+static bool hook_command(KbdSectionInfo *section, int command,
+                         int val, int valhw, int relmode, void *hwnd) {
+    (void)section; (void)val; (void)valhw; (void)relmode; (void)hwnd;
     if (command == g_toggle_action_id) return run_toggle();
     if (command == g_tail_action_id) return run_set_tail();
-    if (command == g_tcp_freeze_action_id) return tcp_button_command(false);
-    if (command == g_tcp_items_lock_action_id) return tcp_button_command(true);
     return false;
 }
 
@@ -972,18 +879,12 @@ int ReaperPluginEntry(void *hInstance, reaper_plugin_info_t *rec) {
     (void)hInstance;
     if (!rec) {
         if (plugin_register_saved) {
-            MFF_TCP_Stop();
-            plugin_register_saved("-timer", (void *)tcp_update_layouts);
-            plugin_register_saved("-hookcommand", (void *)hook_command);
-            plugin_register_saved("-custom_action", (void *)&g_tcp_items_lock_action);
-            plugin_register_saved("-custom_action", (void *)&g_tcp_freeze_action);
+            plugin_register_saved("-hookcommand2", (void *)hook_command);
             plugin_register_saved("-custom_action", (void *)&g_tail_action);
             plugin_register_saved("-custom_action", (void *)&g_toggle_action);
         }
         g_toggle_action_id = 0;
         g_tail_action_id = 0;
-        g_tcp_freeze_action_id = 0;
-        g_tcp_items_lock_action_id = 0;
         plugin_register_saved = NULL;
         return 0;
     }
@@ -995,7 +896,8 @@ int ReaperPluginEntry(void *hInstance, reaper_plugin_info_t *rec) {
     LOAD(CountTracks); LOAD(GetTrack); LOAD(CountSelectedTracks); LOAD(GetSelectedTrack);
     LOAD(GetSetMediaTrackInfo_String); LOAD(GetMediaTrackInfo_Value);
     LOAD(SetMediaTrackInfo_Value); LOAD(CountTrackMediaItems); LOAD(GetTrackMediaItem);
-    LOAD(GetMediaItemInfo_Value); LOAD(GetSet_LoopTimeRange2); LOAD(Main_OnCommand);
+    LOAD(GetMediaItemInfo_Value); LOAD(SetMediaItemInfo_Value);
+    LOAD(GetSetMediaItemInfo_String); LOAD(GetSet_LoopTimeRange2); LOAD(Main_OnCommand);
     LOAD(GetPlayState); LOAD(SetTrackSelected);
     LOAD(DeleteTrack); LOAD(TrackList_AdjustWindows); LOAD(UpdateArrange);
     LOAD(Undo_BeginBlock2); LOAD(Undo_EndBlock2); LOAD(GetTrackColor);
@@ -1005,38 +907,23 @@ int ReaperPluginEntry(void *hInstance, reaper_plugin_info_t *rec) {
     LOAD(TrackFX_GetEnabled); LOAD(TrackFX_SetEnabled);
     LOAD(TrackFX_GetOffline); LOAD(TrackFX_SetOffline); LOAD(ValidatePtr2);
     LOAD(TrackFX_Show); LOAD(TrackFX_GetChainVisible);
-    LOAD(EnumProjects); LOAD(GetMasterTrack); LOAD(GetTrackFromPoint);
-    LOAD(GetMousePosition); LOAD(IsTrackSelected); LOAD(SetOnlyTrackSelected);
-    LOAD(SetMediaItemInfo_Value); LOAD(GetLastColorThemeFile);
-    LOAD(GetResourcePath); LOAD(ThemeLayout_GetLayout);
 #undef LOAD
     plugin_register_saved = rec->Register;
     g_toggle_action_id = plugin_register_saved("custom_action", &g_toggle_action);
     if (g_toggle_action_id <= 0) return 0;
     g_tail_action_id = plugin_register_saved("custom_action", &g_tail_action);
-    if (g_tail_action_id <= 0) goto fail_tail;
-    g_tcp_freeze_action_id = plugin_register_saved("custom_action", &g_tcp_freeze_action);
-    if (g_tcp_freeze_action_id <= 0) goto fail_freeze;
-    g_tcp_items_lock_action_id = plugin_register_saved("custom_action", &g_tcp_items_lock_action);
-    if (g_tcp_items_lock_action_id <= 0) goto fail_lock;
-    if (!plugin_register_saved("hookcommand", (void *)hook_command)) goto fail_hook;
-    if (!plugin_register_saved("timer", (void *)tcp_update_layouts)) goto fail_timer;
-    MFF_TCP_Start();
-    tcp_update_layouts();
+    if (g_tail_action_id <= 0) {
+        plugin_register_saved("-custom_action", &g_toggle_action);
+        g_toggle_action_id = 0;
+        return 0;
+    }
+    if (!plugin_register_saved("hookcommand2", (void *)hook_command)) {
+        plugin_register_saved("-custom_action", &g_tail_action);
+        plugin_register_saved("-custom_action", &g_toggle_action);
+        g_toggle_action_id = 0;
+        g_tail_action_id = 0;
+        return 0;
+    }
     plugin_register_saved("ext_name", (void *)"mixolve_fake-freeze");
     return 1;
-fail_timer:
-    plugin_register_saved("-hookcommand", (void *)hook_command);
-fail_hook:
-    plugin_register_saved("-custom_action", &g_tcp_items_lock_action);
-fail_lock:
-    plugin_register_saved("-custom_action", &g_tcp_freeze_action);
-fail_freeze:
-    plugin_register_saved("-custom_action", &g_tail_action);
-fail_tail:
-    plugin_register_saved("-custom_action", &g_toggle_action);
-    g_tcp_freeze_action_id = g_tcp_items_lock_action_id = 0;
-    g_toggle_action_id = g_tail_action_id = 0;
-    plugin_register_saved = NULL;
-    return 0;
 }

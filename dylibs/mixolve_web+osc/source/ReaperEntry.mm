@@ -15,9 +15,7 @@ static reaper_plugin_info_t *sPlugin = nullptr;
 static BrowserController *sBrowser = nil;
 static BrowserOscFeedback *sOsc = nil;
 static int sOpenId = 0;
-static int sDockId = 0;
-static custom_action_register_t sOpenAction = {0, "CUSTOMWEBBROWSER_OPEN", "Custom Web Browser: Open", nullptr};
-static custom_action_register_t sDockAction = {0, "CUSTOMWEBBROWSER_DOCK", "Custom Web Browser: Toggle docking", nullptr};
+static custom_action_register_t sOpenAction = {0, "MIXOLVE_WEB_OSC_OPEN", "mixolve_web+osc: open", nullptr};
 
 using MainOnCommand = void (*)(int, int);
 using GetToggleState = int (*)(int, int);
@@ -191,6 +189,7 @@ extern "C" bool CWB_Open(const char *url) {
     }
     @autoreleasepool {
         @try {
+            bool createdNow = false;
             if (!sBrowser) {
                 webOscTrace("CWB_Open: browser construction begin");
                 sBrowser = [BrowserController new];
@@ -199,12 +198,24 @@ extern "C" bool CWB_Open(const char *url) {
                     sBrowser = nil;
                     return false;
                 }
+                createdNow = true;
                 webOscTrace("CWB_Open: browser construction complete");
-                // No automatic docking on startup. Only dock on explicit user action.
+                // Restore the stored preference on the first browser opening,
+                // without rewriting it. Missing preference means floating mode.
+                const char *savedDocked = extGet("CustomWebBrowser", "docked");
+                if (savedDocked && std::strcmp(savedDocked, "1") == 0) {
+                    webOscTrace("CWB_Open: restoring saved docked state");
+                    if (![sBrowser applyDocked:YES persistState:NO])
+                        webOscTrace("CWB_Open: saved docking could not be restored");
+                }
             }
             if (url && *url) {
                 NSString *address = [NSString stringWithUTF8String:url];
                 if (address) [sBrowser showURL:address];
+            } else if (createdNow) {
+                // Only restore at the first opening. Reopening an already
+                // visible browser must not reset its current page.
+                [sBrowser restoreLastPage];
             }
             if (sBrowser.docked) {
                 if (sBrowser.dockHost) dockActivate((__bridge void *)sBrowser.dockHost);
@@ -238,19 +249,12 @@ static const char kApiDescription[] =
     "bool\0const char*\0url\0Open the REAPER web browser; empty URL shows the existing page.\0";
 
 static bool dispatchCustomAction(int command, const char *origin) {
-    if (command != sOpenId && command != sDockId) return false;
+    if (sOpenId <= 0 || command != sOpenId) return false;
     char line[160];
-    std::snprintf(line, sizeof(line), "%s: command=%d open=%d dock=%d",
-                  origin, command, sOpenId, sDockId);
+    std::snprintf(line, sizeof(line), "%s: command=%d open=%d",
+                  origin, command, sOpenId);
     webOscTrace(line);
-    if (command == sOpenId) return CWB_Open(nullptr);
-    if (!sBrowser && !CWB_Open(nullptr)) return false;
-    @try { [sBrowser toggleDock:nil]; }
-    @catch (NSException *exception) {
-        webOscTraceObjCException("dock action exception", exception);
-        return false;
-    }
-    return true;
+    return CWB_Open(nullptr);
 }
 // hookcommand2 covers keyboard/MIDI/OSC invocation. hookcommand also covers
 // ordinary main-section actions (including invocation from Actions list).
@@ -261,11 +265,6 @@ static bool hookMainCommand(int command, int flag) {
     (void)flag;
     return dispatchCustomAction(command, "hookcommand");
 }
-static int hookToggleState(int command) {
-    if (command == sDockId && sDockId > 0) return sBrowser && sBrowser.docked ? 1 : 0;
-    return -1;
-}
-
 static void unregisterPlugin() {
     webOscTrace("plugin: unloading");
     [sOsc stop]; sOsc = nil;
@@ -273,15 +272,13 @@ static void unregisterPlugin() {
     if (sPlugin && sPlugin->Register) {
         sPlugin->Register("-hookcommand2", reinterpret_cast<void *>(hookCommand));
         sPlugin->Register("-hookcommand", reinterpret_cast<void *>(hookMainCommand));
-        sPlugin->Register("-toggleaction", reinterpret_cast<void *>(hookToggleState));
         sPlugin->Register("-custom_action", &sOpenAction);
-        sPlugin->Register("-custom_action", &sDockAction);
         sPlugin->Register("-API_CWB_Open", reinterpret_cast<void *>(CWB_Open));
         sPlugin->Register("-APIvararg_CWB_Open", reinterpret_cast<void *>(CWB_Open_vararg));
         sPlugin->Register("-APIdef_CWB_Open", const_cast<char *>(kApiDescription));
     }
     sPlugin = nullptr;
-    sOpenId = sDockId = 0;
+    sOpenId = 0;
     installRecoveredReaperCallbacks({});
     sRun = nullptr; sToggle = nullptr; sNamed = nullptr; sReverse = nullptr;
     sResource = nullptr; sSection = nullptr; sEnumerate = nullptr;
@@ -320,14 +317,13 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
             reverseLookup, dockAdd, dockRemove, dockActivate, createDockHost,
             destroyDockHost, resourcePath, extGet, extSet});
         sOpenId = rec->Register("custom_action", &sOpenAction);
-        sDockId = rec->Register("custom_action", &sDockAction);
-        if (!sOpenId || !sDockId || sOpenId == sDockId) {
-            webOscTrace("plugin: action registration failed or IDs are not distinct");
+        if (!sOpenId) {
+            webOscTrace("plugin: open action registration failed");
             unregisterPlugin(); return 0;
         }
         {
             char line[160];
-            std::snprintf(line, sizeof(line), "plugin: actions registered open=%d dock=%d", sOpenId, sDockId);
+            std::snprintf(line, sizeof(line), "plugin: action registered open=%d", sOpenId);
             webOscTrace(line);
         }
         if (!rec->Register("hookcommand2", reinterpret_cast<void *>(hookCommand))) {
@@ -338,7 +334,6 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
             webOscTrace("plugin: hookcommand registration failed");
             unregisterPlugin(); return 0;
         }
-        rec->Register("toggleaction", reinterpret_cast<void *>(hookToggleState));
         rec->Register("API_CWB_Open", reinterpret_cast<void *>(CWB_Open));
         rec->Register("APIvararg_CWB_Open", reinterpret_cast<void *>(CWB_Open_vararg));
         rec->Register("APIdef_CWB_Open", const_cast<char *>(kApiDescription));

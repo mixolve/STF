@@ -32,7 +32,7 @@ int ReaperPluginEntry(void *module, ep::Info *info) {
         if (started) return 1;
         if (info->version != 0x20e || !info->get || !info->reg) return 0;
 
-        // Windows register first so the two Main-section actions remain
+        // Windows register first so the window actions remain
         // available even if SWS/envelope or rename APIs are unavailable.
         windowsStarted = MixolveFXWindowsStart(info);
         envelopeStarted = MixolveEnvelopeEntry(info) != 0;

@@ -11,11 +11,18 @@
 
 static NSString *const kExtSection = @"CustomWebBrowser";
 static NSString *const kOscConfigName = @"browser-osc-feedback.json";
+static const char *kLastPageKey = "last_url";
+// URL is documented as KVO-compliant on WKWebView. Watch it so address
+// changes made through history.pushState/replaceState are remembered too.
+static void *kPageURLObservationContext = &kPageURLObservationContext;
 
 @interface BrowserController () {
     webOscVisibility::State _toolbarVisibility;
 }
 - (void)updateToolbarHover;
+- (void)popupDidOpen:(NSNotification *)notification;
+- (void)popupDidClose:(NSNotification *)notification;
+@property (nonatomic, strong) NSCountedSet *activeToolbarPopups;
 @property (nonatomic, strong) NSLayoutConstraint *controlPanelHeightConstraint;
 @property (nonatomic, strong) NSTimer *toolbarHoverTimer;
 @property (nonatomic, strong) NSView *listenGroup;
@@ -23,6 +30,8 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
 @property (nonatomic, strong) NSView *sendGroup;
 @property (nonatomic) BOOL shuttingDown;
 @property (nonatomic) BOOL dockTransitioning;
+@property (nonatomic) BOOL observingPageURL;
+@property (nonatomic, copy) NSString *lastSavedPageURL;
 @end
 
 // A plain NSView has no painted background. In a floating NSWindow this is
@@ -166,6 +175,23 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
         self.controlPanelHeightConstraint
     ]];
     self.controlPanel.hidden = YES;
+    // Native menus, combo-box dropdowns and popovers can extend outside the
+    // browser view. Keep the bottom toolbar shown while one is being used.
+    // Pair begin/end notifications by popup object (including nested menus).
+    self.activeToolbarPopups = [NSCountedSet new];
+    NSNotificationCenter *notifications = [NSNotificationCenter defaultCenter];
+    for (NSString *name in @[NSMenuDidBeginTrackingNotification,
+                             NSComboBoxWillPopUpNotification,
+                             NSPopoverWillShowNotification]) {
+        [notifications addObserver:self selector:@selector(popupDidOpen:)
+                             name:name object:nil];
+    }
+    for (NSString *name in @[NSMenuDidEndTrackingNotification,
+                             NSComboBoxWillDismissNotification,
+                             NSPopoverDidCloseNotification]) {
+        [notifications addObserver:self selector:@selector(popupDidClose:)
+                             name:name object:nil];
+    }
     // Both floating-window and SWELL Docker resizing change the same root
     // NSView frame. Use a frame-change notification, not only NSWindowDelegate.
     root.postsFrameChangedNotifications = YES;
@@ -191,7 +217,11 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
             [self.web.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
             [self.web.bottomAnchor constraintEqualToAnchor:self.controlPanel.topAnchor]
         ]];
-        webOscTrace("browser: WKWebView ready");
+        [self.web addObserver:self forKeyPath:@"URL"
+                         options:NSKeyValueObservingOptionNew
+                         context:kPageURLObservationContext];
+        self.observingPageURL = YES;
+        webOscTrace("browser: WKWebView ready; page URL observation active");
     } @catch (NSException *exception) {
         webOscTraceObjCException("browser: WKWebView exception", exception);
         webOscTrace("browser: WebKit unavailable; see diagnostic log");
@@ -279,6 +309,51 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
 - (void)applyOscSettings:(id)sender { (void)sender; [self saveOscEnabled:self.oscEnable.state == NSControlStateValueOn]; }
 - (void)toggleOscEnabled:(id)sender { [self applyOscSettings:sender]; }
 
+// Persist only a URL that WKWebView is displaying. A requested URL can
+// fail to load; recording it eagerly would overwrite the last working page.
+- (void)persistCurrentPageURL {
+    if (self.shuttingDown || !self.web) return;
+    NSURL *url = self.web.URL;
+    NSString *address = url.absoluteString;
+    NSString *scheme = url.scheme.lowercaseString;
+    if (!address.length ||
+        (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"] &&
+         ![address isEqualToString:@"about:blank"])) return;
+    // Persistent REAPER ExtState values occupy a single line in an .ini file.
+    if ([address rangeOfCharacterFromSet:[NSCharacterSet newlineCharacterSet]].location != NSNotFound)
+        return;
+    if ([address isEqualToString:self.lastSavedPageURL]) return;
+    auto api = recoveredReaperCallbacks();
+    if (!api.setExtState) return;
+    const char *utf8 = address.UTF8String;
+    if (!utf8) return;
+    api.setExtState(kExtSection.UTF8String, kLastPageKey, utf8, true);
+    self.lastSavedPageURL = address;
+    webOscTrace("browser: current page URL saved");
+}
+- (void)restoreLastPage {
+    auto api = recoveredReaperCallbacks();
+    if (!api.getExtState || !self.web) return;
+    const char *stored = api.getExtState(kExtSection.UTF8String, kLastPageKey);
+    if (!stored || !*stored) return;
+    NSString *address = [NSString stringWithUTF8String:stored];
+    if (!address.length) return;
+    webOscTrace("browser: restoring last page URL");
+    [self showURL:address];
+}
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+                        change:(NSDictionary *)change context:(void *)context {
+    if (context == kPageURLObservationContext) {
+        if (object == self.web && [keyPath isEqualToString:@"URL"] && !self.shuttingDown) {
+            [self updateNavigation];
+            // Provisional navigations can fail. Wait for didFinishNavigation
+            // before storing them, but store same-document URL changes now.
+            if (![self.web isLoading]) [self persistCurrentPageURL];
+        }
+        return;
+    }
+    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+}
 - (void)showURL:(NSString *)text {
     NSString *value = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (value.length == 0 || !self.web) return;
@@ -304,7 +379,9 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
     (void)view; (void)nav; [self updateNavigation];
 }
 - (void)webView:(WKWebView *)view didFinishNavigation:(WKNavigation *)nav {
-    (void)view; (void)nav; [self updateNavigation];
+    (void)view; (void)nav;
+    [self updateNavigation];
+    [self persistCurrentPageURL];
 }
 - (void)webView:(WKWebView *)view didFailProvisionalNavigation:(WKNavigation *)nav withError:(NSError *)error {
     (void)view; (void)nav;
@@ -322,7 +399,16 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
 - (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message {
     (void)controller; (void)message;
 }
-- (void)controlTextDidBeginEditing:(NSNotification *)note { (void)note; self.pageEditing = YES; }
+- (void)controlTextDidBeginEditing:(NSNotification *)note {
+    (void)note;
+    self.pageEditing = YES;
+    // Cmd+L can focus the address field while the toolbar is collapsed.
+    // Focused controls should always remain accessible, even if the mouse
+    // moves outside the browser while editing or opening a context menu.
+    _toolbarVisibility.visible = true;
+    _toolbarVisibility.enteredEdgeAt = -1.0;
+    [self setControlsVisible:YES];
+}
 - (void)controlTextDidEndEditing:(NSNotification *)note {
     self.pageEditing = NO;
     id field = note.object;
@@ -337,6 +423,18 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
     }
     return NO;
 }
+- (void)popupDidOpen:(NSNotification *)notification {
+    if (self.shuttingDown || self.dockTransitioning || !notification.object) return;
+    // Never reveal the toolbar just because a menu elsewhere in REAPER opens.
+    // Only hold a toolbar that was already shown, or one already held by a
+    // previous popup (for nested menus and popovers).
+    if (self.controlPanel.hidden && self.activeToolbarPopups.count == 0) return;
+    [self.activeToolbarPopups addObject:notification.object];
+}
+- (void)popupDidClose:(NSNotification *)notification {
+    if (notification.object) [self.activeToolbarPopups removeObject:notification.object];
+    // Normal hover rules resume on the next timer tick after the popup closes.
+}
 - (void)setControlsVisible:(BOOL)visible {
     if (!self.controlPanel || !self.controlPanelHeightConstraint ||
         self.controlPanel.hidden == !visible) return;
@@ -348,7 +446,10 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
     [self.content setNeedsLayout:YES];
 }
 - (void)updateToolbarHover {
-    if (self.shuttingDown || self.dockTransitioning || ![NSApp isActive]) {
+    const BOOL popupOpen = self.activeToolbarPopups.count > 0;
+    // A native popup can transiently change the key window/activation state.
+    // Do not collapse its parent toolbar until the popup has actually closed.
+    if (self.shuttingDown || self.dockTransitioning || (![NSApp isActive] && !popupOpen)) {
         _toolbarVisibility.reset();
         [self setControlsVisible:NO];
         return;
@@ -374,7 +475,8 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
     const BOOL nearBottom = inside && fromBottom <= webOscVisibility::kEdgeTriggerHeight;
     const BOOL overPanel = inside && fromBottom <= webOscLayout::kPanelHeight;
     const double now = NSProcessInfo.processInfo.systemUptime;
-    const BOOL show = _toolbarVisibility.update(now, inside, nearBottom, overPanel, self.pageEditing);
+    const BOOL show = _toolbarVisibility.update(now, inside, nearBottom, overPanel,
+                                                self.pageEditing, popupOpen);
     [self setControlsVisible:show];
 }
 - (BOOL)editingText { return self.pageEditing; }
@@ -386,6 +488,11 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
     }
 }
 - (BOOL)applyDocked:(BOOL)requested {
+    return [self applyDocked:requested persistState:YES];
+}
+// Shutdown cleanup and startup restoration must not overwrite the user's
+// persistent Dock/Undock choice.
+- (BOOL)applyDocked:(BOOL)requested persistState:(BOOL)persistState {
     if (![NSThread isMainThread] || self.shuttingDown || self.dockTransitioning)
         return NO;
     if (self.docked == requested) return YES;
@@ -436,7 +543,7 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
             [self.window orderOut:nil];
             api.dockWindowActivate(raw);
             self.dockButton.title = @"Undock";
-            if (api.setExtState)
+            if (persistState && api.setExtState)
                 api.setExtState(kExtSection.UTF8String, "docked", "1", true);
             webOscTrace("dock: attached to REAPER Docker");
             self.dockTransitioning = NO;
@@ -477,7 +584,7 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
         [self.window makeKeyAndOrderFront:nil];
         [self.window orderFrontRegardless];
         self.dockButton.title = @"Dock";
-        if (api.setExtState)
+        if (persistState && api.setExtState)
             api.setExtState(kExtSection.UTF8String, "docked", "0", true);
         webOscTrace("dock: restored floating window");
         self.dockTransitioning = NO;
@@ -495,19 +602,30 @@ static NSString *const kOscConfigName = @"browser-osc-feedback.json";
     }
 }
 - (void)saveFrame { /* fixed visible initial position in this stability build */ }
-- (void)closeBrowser:(id)sender { (void)sender; [self.window orderOut:nil]; }
+- (void)closeBrowser:(id)sender {
+    (void)sender;
+    if (self.web && ![self.web isLoading]) [self persistCurrentPageURL];
+    [self.window orderOut:nil];
+}
 - (BOOL)windowShouldClose:(id)sender { [self closeBrowser:sender]; return NO; }
 - (void)shutdown {
     if (self.shuttingDown) return;
+    // Last safety net; ordinary navigation is already persisted immediately.
+    if (self.web && ![self.web isLoading]) [self persistCurrentPageURL];
+    if (self.observingPageURL) {
+        [self.web removeObserver:self forKeyPath:@"URL" context:kPageURLObservationContext];
+        self.observingPageURL = NO;
+    }
     [self.toolbarHoverTimer invalidate];
     self.toolbarHoverTimer = nil;
+    [self.activeToolbarPopups removeAllObjects];
     _toolbarVisibility.reset();
     [self setControlsVisible:NO];
     // Never destroy the SWELL view while it is still registered with Docker.
-    if (self.docked) [self applyDocked:NO];
+    if (self.docked) [self applyDocked:NO persistState:NO];
     self.shuttingDown = YES;
-    [[NSNotificationCenter defaultCenter] removeObserver:self
-        name:NSViewFrameDidChangeNotification object:self.content];
+    // Includes view-resize and popup lifecycle notifications.
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
     self.web.navigationDelegate = nil;
     self.web.UIDelegate = nil;
     [self.web stopLoading];

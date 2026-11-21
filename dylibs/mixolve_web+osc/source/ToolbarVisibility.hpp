@@ -20,14 +20,19 @@ struct State {
     // inside: pointer is inside the browser's content view
     // atEdge: pointer is inside and within the activation strip at the bottom
     // overPanel: pointer is over the visible toolbar, including its controls
-    // editing: keep toolbar visible while a text field has focus
-    bool update(double now, bool inside, bool atEdge, bool overPanel, bool editing) {
+    // editing: keep toolbar visible while a toolbar text field has focus,
+    //          even if the pointer leaves the browser view
+    // popupOpen: keep a visible toolbar open while a native menu/popover is up
+    bool update(double now, bool inside, bool atEdge, bool overPanel,
+                bool editing, bool popupOpen) {
         if (!std::isfinite(now)) {
             reset();
             return visible;
         }
         if (visible) {
-            if (!inside || (!overPanel && !editing)) reset();
+            // Popup menus frequently sit outside the toolbar/browser bounds.
+            // Pointer location alone must not dismiss a toolbar in use.
+            if (!editing && !popupOpen && (!inside || !overPanel)) reset();
             return visible;
         }
         if (!inside || !atEdge) {

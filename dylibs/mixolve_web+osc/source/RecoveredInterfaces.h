@@ -64,6 +64,8 @@
 - (void)controlTextDidBeginEditing:(NSNotification *)note;
 - (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message;
 - (void)showURL:(NSString *)url;
+- (void)restoreLastPage;
+- (void)persistCurrentPageURL;
 - (void)navigate:(id)sender;
 - (void)updateNavigation;
 - (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation;
@@ -76,6 +78,7 @@
 - (void)windowDidResize:(NSNotification *)note;
 - (void)layoutDock;
 - (BOOL)applyDocked:(BOOL)docked;
+- (BOOL)applyDocked:(BOOL)docked persistState:(BOOL)persistState;
 - (void)closeBrowser:(id)sender;
 - (void)toggleDock:(id)sender;
 - (void)saveFrame;
