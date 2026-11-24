@@ -74,7 +74,11 @@ std::vector<Item>scan(){std::vector<Item>v;for(int n=0;n<CountMediaItems(project
  Item a;a.ptr=i;a.track=GetMediaItemTrack(i);a.guid=readString(i,"GUID");a.trackId=trackId(a.track);
  a.parent=readString(i,parentKey);a.child=readString(i,childKey);a.source=readString(i,sourceKey);
  a.position=GetMediaItemInfo_Value(i,"D_POSITION");a.length=GetMediaItemInfo_Value(i,"D_LENGTH");a.selected=IsMediaItemSelected(i);v.push_back(std::move(a));}return v;}
-bool participates(const Item&i,const std::string&id){auto p=manifest.parents.find(id);return p!=manifest.parents.end()&&i.parent==id&&i.child.empty()&&!p->second.tracks.empty()&&i.trackId==p->second.tracks.front()&&i.position>=p->second.start-1e-9&&i.position+i.length<=p->second.end+1e-9;}
+bool insideParent(const Item&i,const lc::Parent&parent){
+ return !parent.tracks.empty()&&i.trackId==parent.tracks.front()&&
+        i.position>=parent.start-1e-9&&i.position+i.length<=parent.end+1e-9;
+}
+bool participates(const Item&i,const std::string&id){auto p=manifest.parents.find(id);return p!=manifest.parents.end()&&i.parent==id&&i.child.empty()&&insideParent(i,p->second);}
 int nextGroup(const std::vector<Item>&items){int max=0;for(auto&i:items)max=std::max(max,static_cast<int>(GetMediaItemInfo_Value(i.ptr,"I_GROUPID")));return max==std::numeric_limits<int>::max()?0:max+1;}
 std::string selection(const std::vector<Item>&items){if(manifest.parents.count(selectedContainer)||manifest.children.count(selectedContainer))return selectedContainer;std::set<std::string>ids;bool any=false;for(auto&i:items)if(i.selected){any=true;if(manifest.children.count(i.child))ids.insert(i.child);else if(manifest.parents.count(i.parent))ids.insert(i.parent);}
  if(ids.size()==1)return *ids.begin();if(any)return {};if(!selectedContainer.empty()&&(manifest.parents.count(selectedContainer)||manifest.children.count(selectedContainer)))return selectedContainer;return {};}
@@ -162,8 +166,7 @@ void sync(bool force){
  if(unknownManifest){error="Unsupported container metadata version. Project data was not changed.";return;}
  busy=true;error.clear();sceneChanged=false;PreventUIRefresh(1);
  auto items=scan();if(justLoaded){viewItems=items;for(auto&i:items)if(manifest.children.count(i.child))hideChildFxWindows(i.ptr);}
- // One physical row per container. Keep off-row originals intact; only the
- // anchor track participates. Historical multi-row metadata is normalized.
+ // One physical row per container. Historical multi-row metadata is normalized.
  for(auto&[_,parent]:manifest.parents)if(parent.tracks.size()>1)parent.tracks.resize(1);
  std::map<std::string,Item>prior;for(auto&i:viewItems)prior[i.guid]=i;
  // Items created/split inside exactly one existing parent window join it.
@@ -176,20 +179,18 @@ void sync(bool force){
   }
   if(matches.size()==1){i.parent=matches.front();writeString(i.ptr,parentKey,i.parent);writeString(i.ptr,"P_EXT:LINKED_ITEMS_V1","");SetMediaItemInfo_Value(i.ptr,"I_GROUPID",manifest.parents[i.parent].group);}
  }
- std::map<std::string,std::vector<Source>>source;
- for(auto&i:items)if(manifest.parents.count(i.parent)&&i.child.empty()){
-  auto chunk=getChunk(i.ptr);if(chunk.empty()){error="Could not read parent item state; linked copies were not changed.";PreventUIRefresh(-1);busy=false;return;}source[i.parent].push_back({i,std::move(chunk),gains(i.ptr)});
- }
- for(auto&[id,parent]:manifest.parents){auto&s=source[id];if(!s.empty()){
+ std::map<std::string,std::vector<Item*>>members;
+ for(auto&i:items)if(manifest.parents.count(i.parent)&&i.child.empty())members[i.parent].push_back(&i);
+ for(auto&[id,parent]:manifest.parents){auto&s=members[id];if(!s.empty()){
   // The frame is a persistent container window, not the current bounding box
   // of the remaining fragments. Deleting/trimming edge pieces leaves silence.
   bool whole=!containerDragActive;double delta=0;int rows=0;size_t oldCount=0;
   for(auto&[_,old]:prior)if(old.parent==id&&old.child.empty())oldCount++;
   whole&=oldCount==s.size();bool first=true;
-  for(auto&i:s){auto old=prior.find(i.item.guid);if(old==prior.end()){whole=false;break;}
-   double d=i.item.position-old->second.position;int r=trackIndex(i.item.track)-trackIndex(old->second.track);
+  for(auto*i:s){auto old=prior.find(i->guid);if(old==prior.end()){whole=false;break;}
+   double d=i->position-old->second.position;int r=trackIndex(i->track)-trackIndex(old->second.track);
    if(first){delta=d;rows=r;first=false;}else if(std::abs(delta-d)>1e-8||rows!=r)whole=false;
-   if(std::abs(i.item.length-old->second.length)>1e-8)whole=false;
+   if(std::abs(i->length-old->second.length)>1e-8)whole=false;
   }
   if(whole&&(std::abs(delta)>1e-9||rows)){
    double earliest=parent.start;for(auto&[_,child]:manifest.children)if(child.parent==id)earliest=std::min(earliest,parent.start+child.offset);
@@ -197,22 +198,48 @@ void sync(bool force){
    std::string requestedTrack=parent.tracks.front();int destination=trackIndex(track(requestedTrack))+rows;
    if(rows&&destination>=0&&ensureTrackCount(destination+1))requestedTrack=trackId(GetTrack(project,destination));
    bool correctedTime=std::abs(allowed-delta)>1e-9;
-   for(auto&i:s){
-    if(correctedTime){i.item.position+=allowed-delta;SetMediaItemInfo_Value(i.item.ptr,"D_POSITION",i.item.position);}
-    if(i.item.trackId!=requestedTrack){ensureTrack(i.item.ptr,track(requestedTrack));i.item.track=track(requestedTrack);i.item.trackId=requestedTrack;}
-    // Source chunks must reflect corrected position/track before mirroring.
-    if(correctedTime)i.chunk=getChunk(i.item.ptr);
+   Ptr target=track(requestedTrack);
+   for(auto*i:s){
+    if(correctedTime){i->position+=allowed-delta;SetMediaItemInfo_Value(i->ptr,"D_POSITION",i->position);}
+    if(i->trackId!=requestedTrack&&ensureTrack(i->ptr,target)){i->track=target;i->trackId=requestedTrack;}
    }
    parent.start+=allowed;parent.end+=allowed;parent.tracks={requestedTrack};
   }
-  std::sort(s.begin(),s.end(),[](auto&a,auto&b){return a.item.guid<b.item.guid;});
  }}
+ std::map<std::string,std::vector<Source>>source;
+ for(auto&i:items){
+  auto owner=manifest.parents.find(i.parent);
+  if(owner==manifest.parents.end()||!i.child.empty())continue;
+  if(i.trackId!=owner->second.tracks.front()&&readString(i.ptr,"P_EXT:LC2_EXCLUDED")!="1"){
+   // Resolve retained tags after detecting whole-container moves. An item
+   // moved on its own can join a single enclosing parent on its new track.
+   auto destination=manifest.parents.end();
+   for(auto candidate=manifest.parents.begin();candidate!=manifest.parents.end();++candidate){
+    if(!insideParent(i,candidate->second))continue;
+    if(destination!=manifest.parents.end()){destination=manifest.parents.end();break;}
+    destination=candidate;
+   }
+   if(destination!=manifest.parents.end()){
+    owner=destination;
+    i.parent=owner->first;
+    writeString(i.ptr,parentKey,i.parent);
+    writeString(i.ptr,"P_EXT:LINKED_ITEMS_V1","");
+    SetMediaItemInfo_Value(i.ptr,"I_GROUPID",owner->second.group);
+    sceneChanged=true;
+   }
+  }
+  if(!insideParent(i,owner->second))continue;
+  auto chunk=getChunk(i.ptr);
+  if(chunk.empty()){error="Could not read parent item state; linked copies were not changed.";PreventUIRefresh(-1);busy=false;return;}
+  source[i.parent].push_back({i,std::move(chunk),gains(i.ptr)});
+ }
+ for(auto&[_,sources]:source)
+  std::sort(sources.begin(),sources.end(),[](const Source&a,const Source&b){return a.item.guid<b.item.guid;});
  for(auto&[_,child]:manifest.children){auto it=manifest.parents.find(child.parent);if(it!=manifest.parents.end()){
-  auto visible=source[child.parent];auto&window=it->second;
+  auto&window=it->second;
   // Track placement belongs to the parent; copies only own a time offset.
   child.tracks=window.tracks;
-  visible.erase(std::remove_if(visible.begin(),visible.end(),[&](const Source&s){return s.item.trackId!=window.tracks.front()||s.item.position<window.start-1e-9||s.item.position+s.item.length>window.end+1e-9;}),visible.end());
-  rebuild(child,window,visible,items);
+  rebuild(child,window,source[child.parent],items);
  }}
  saveManifest();viewItems=scan();lastState=GetProjectStateChangeCount(project);lastUndo=Undo_GetCurEntry(project);quickState=quick();
  PreventUIRefresh(-1);busy=false;if(force||sceneChanged)UpdateArrange();
@@ -289,7 +316,12 @@ void action(int which,const std::string&target){
  double offset=(duplicateNext?duplicateStart:GetCursorPositionEx(project))-parent.start;
  if(!destination||trackIndex(destination)<0||!std::isfinite(offset)||!nextGroup(items)){ShowMessageBox("The parent track or linked-copy position is invalid.","Linked containers",0);return;}
  auto oldManifest=manifest;std::vector<std::pair<Ptr,std::string>>oldSources;
- if(newParent)for(auto&i:items)if(i.selected||(i.parent.empty()&&i.child.empty()&&i.position>=parent.start-1e-8&&i.position+i.length<=parent.end+1e-8&&std::find(parent.tracks.begin(),parent.tracks.end(),i.trackId)!=parent.tracks.end())){
+ if(newParent)for(auto&i:items){
+  auto owner=manifest.parents.find(i.parent);
+  bool mayJoin=i.child.empty()&&(i.parent.empty()||
+       (owner!=manifest.parents.end()&&i.trackId!=owner->second.tracks.front()));
+  if(!i.selected&&!(mayJoin&&i.trackId==parent.tracks.front()&&
+      i.position>=parent.start-1e-8&&i.position+i.length<=parent.end+1e-8))continue;
   auto chunk=getChunk(i.ptr);if(chunk.empty()){ShowMessageBox("Could not read source item state.","Linked containers",0);return;}oldSources.emplace_back(i.ptr,std::move(chunk));}
  Undo_BeginBlock2(project);busy=true;PreventUIRefresh(1);
  if(newParent){manifest.parents[parent.id]=parent;for(auto&i:selected){writeString(i.ptr,parentKey,parent.id);writeString(i.ptr,"P_EXT:LC2_EXCLUDED","");writeString(i.ptr,"P_EXT:LINKED_ITEMS_V1","");SetMediaItemInfo_Value(i.ptr,"I_GROUPID",parent.group);}}

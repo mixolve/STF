@@ -26,6 +26,8 @@ static MediaTrack *(*r_GetSelectedTrack2)(ReaProject *, int, bool);
 static void (*r_SetOnlyTrackSelected)(MediaTrack *);
 static void (*r_SetTrackSelected)(MediaTrack *, bool);
 static double (*r_GetSetProjectInfo)(ReaProject *, const char *, double, bool);
+static int (*r_projectconfig_var_getoffs)(const char *, int *);
+static void *(*r_projectconfig_var_addr)(ReaProject *, int);
 static bool (*r_GetSetProjectInfo_String)(ReaProject *, const char *, char *, bool);
 static void (*r_GetProjectPathEx)(ReaProject *, char *, int);
 static int (*r_RecursiveCreateDirectory)(const char *, size_t);
@@ -78,9 +80,23 @@ typedef struct {
     char saved[RENDER_STRING_SIZE];
 } RenderString;
 
+static int *get_int_project_config(ReaProject *project, const char *key) {
+    int size = 0;
+    int offset = r_projectconfig_var_getoffs(key, &size);
+    if (offset <= 0 || size != sizeof(int)) return NULL;
+    return r_projectconfig_var_addr(project, offset);
+}
+
 static bool render_fast_wav(ReaProject *project, char *directory, char *name,
                             double start, double end, int bounds, int channels,
                             const char **failure) {
+    int *speed_mode = get_int_project_config(project, "projrenderlimit");
+    int *speed_cap = get_int_project_config(project, "projrenderspeedcap");
+    if (!speed_mode || !speed_cap) {
+        *failure = "could not set full-speed offline rendering";
+        return false;
+    }
+
     RenderNumber numbers[] = {
         {"RENDER_SETTINGS", RENDER_SELECTED_STEMS | RENDER_PRE_FADER, 0},
         {"RENDER_BOUNDSFLAG", bounds, 0},
@@ -120,7 +136,13 @@ static bool render_fast_wav(ReaProject *project, char *directory, char *name,
         }
 
     if (configured) {
+        const int previous_mode = *speed_mode;
+        const int previous_cap = *speed_cap;
+        *speed_mode = 0; /* Full-speed offline. */
+        *speed_cap = 0;
         r_Main_OnCommand(ACT_RENDER_RECENT_AUTO_CLOSE, 0);
+        *speed_mode = previous_mode;
+        *speed_cap = previous_cap;
         const int settings = (int)r_GetSetProjectInfo(project, "RENDER_SETTINGS", 0, false);
         if ((settings & 0x3) != RENDER_SELECTED_STEMS) {
             *failure = "REAPER changed the render source away from selected track stems";
@@ -670,6 +692,8 @@ static void register_fast_actions(reaper_plugin_info_t *info) {
     LOAD_FAST(SetOnlyTrackSelected);
     LOAD_FAST(SetTrackSelected);
     LOAD_FAST(GetSetProjectInfo);
+    LOAD_FAST(projectconfig_var_getoffs);
+    LOAD_FAST(projectconfig_var_addr);
     LOAD_FAST(GetSetProjectInfo_String);
     LOAD_FAST(GetProjectPathEx);
     LOAD_FAST(RecursiveCreateDirectory);
