@@ -1,6 +1,7 @@
 // mixolve_custom-view — standalone REAPER extension entry.
 // The window controller is independent of envelope/SWS and track-name APIs.
 #import <Foundation/Foundation.h>
+#include <cstdio>
 #include "model.hpp"
 #include "fx-windows.hpp"
 
@@ -41,6 +42,16 @@ int ReaperPluginEntry(void *module, ep::Info *info) {
         trackNameStarted = MixolveTrackNameEntry(info);
 
         started = windowsStarted || envelopeStarted || trackNameStarted;
+        // A runtime load marker distinguishes an old/misplaced .dylib from
+        // a drawing failure. In particular, the TCP hook must have started.
+        NSString *loadPath = [NSHomeDirectory() stringByAppendingPathComponent:
+            @"Library/Logs/mixolve-custom-view-load.log"];
+        if (FILE *fp = fopen(loadPath.fileSystemRepresentation, "a")) {
+            fprintf(fp, "v85: loaded=%d tcp=%d toolbar=%d fx=%d\n",
+                (int)started, (int)trackNameStarted, (int)envelopeStarted,
+                (int)windowsStarted);
+            fclose(fp);
+        }
         if (!started) {
             if (keyboardStarted) MixolveKeyboardStop();
             keyboardStarted = false;

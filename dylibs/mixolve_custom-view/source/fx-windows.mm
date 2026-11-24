@@ -1,5 +1,5 @@
 // mixolve_custom-view — native macOS window chrome controller.
-// Hides ACTUAL NSWindow titlebars, not merely their title text.
+// Removes visible window chrome while preserving REAPER FX editor layout.
 // Main REAPER window and floating Track/Take/Input/Monitoring FX.
 // FX Chain windows are explicitly excluded from all titlebar changes.
 // Movement is exclusively user-initiated via the Move action.
@@ -83,7 +83,8 @@ static NSMutableArray *savedPresetPanels = nil;
 static NSMapTable<NSWindow *, NSNumber *> *presetOverrides = nil;
 // Stable FX GUIDs are used to restore focused per-FX overrides after restart.
 static NSMapTable<NSWindow *, NSString *> *presetWindowKeys = nil;
-static id keyObserver = nil, closeObserver = nil, resizeObserver = nil, updateObserver = nil;
+static id keyObserver = nil, closeObserver = nil, resizeObserver = nil, updateObserver = nil, terminateObserver = nil;
+static bool applicationTerminating = false;
 static CFAbsoluteTime nextUpdate = 0;
 static CFAbsoluteTime nextFullFXScan = 0;
 static uint64_t lastWindowSignature = 0;
@@ -91,11 +92,12 @@ static uint64_t lastWindowSignature = 0;
 @interface MXWindowSnapshot : NSObject
 @property (nonatomic, weak) NSWindow *window;
 @property (nonatomic) NSWindowStyleMask style;
-@property (nonatomic) NSRect frame;
 @property (nonatomic) NSSize minSize;
 @property (nonatomic) NSSize contentMinSize;
 @property (nonatomic) NSWindowTitleVisibility titleVisibility;
 @property (nonatomic) BOOL transparentTitle;
+@property (nonatomic) NSTitlebarSeparatorStyle titlebarSeparator;
+@property (nonatomic) NSUInteger hiddenTitlebarButtons;
 @property (nonatomic) BOOL shadow;
 @property (nonatomic) BOOL toolbarVisible;
 @property (nonatomic, strong) NSToolbar *toolbar;
@@ -113,9 +115,11 @@ static uint64_t lastWindowSignature = 0;
 @property (nonatomic, weak) NSWindow *window;
 @property (nonatomic, strong) NSView *contentRoot;
 @property (nonatomic) NSUInteger originalAutoresizingMask;
-@property (nonatomic) NSSize previousMinSize;
 @property (nonatomic) NSSize previousContentMinSize;
 @property (nonatomic) CGFloat removedHeight;
+// The frame may refuse the requested shrink (e.g. during host re-layout).
+// Restore only the height that NSWindow actually lost.
+@property (nonatomic) CGFloat appliedWindowCrop;
 @end
 @implementation MXPresetPanelSnapshot @end
 
@@ -130,6 +134,10 @@ static NSWindow *focusedFXTargetForHostControls();
 static void applyPreset(NSWindow *w);
 static NSString *presetKeyForWindow(NSWindow *w);
 static NSNumber *getPresetOverride(NSWindow *w);
+static CGFloat presetCropHeight(NSWindow *w);
+static MXPresetPanelSnapshot *findPresetSnapshot(NSWindow *w);
+static void reconcileMonitoringHeightBeforeChrome(NSWindow *w);
+static void rememberMonitoringHeightFromUserResize(NSWindow *w);
 
 // SWELL HWND is an Objective-C window/view on macOS. Do not treat it as an
 // opaque NSWindow pointer; first ask the host object for its actual window.
@@ -154,6 +162,9 @@ static MXWindowSnapshot *findSnapshot(NSWindow *w) {
     for (MXWindowSnapshot *s in savedWindows) if (s.window == w) return s;
     return nil;
 }
+static constexpr NSWindowButton titlebarButtons[] = {
+    NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton
+};
 static MXWindowSnapshot *remember(NSWindow *w) {
     if (!w) return nil;
     MXWindowSnapshot *s = findSnapshot(w);
@@ -161,11 +172,15 @@ static MXWindowSnapshot *remember(NSWindow *w) {
     s = [MXWindowSnapshot new];
     s.window = w;
     s.style = w.styleMask;
-    s.frame = w.frame;
     s.minSize = w.minSize;
     s.contentMinSize = w.contentMinSize;
     s.titleVisibility = w.titleVisibility;
     s.transparentTitle = w.titlebarAppearsTransparent;
+    s.titlebarSeparator = w.titlebarSeparatorStyle;
+    for (NSUInteger i = 0; i < sizeof(titlebarButtons) / sizeof(titlebarButtons[0]); ++i) {
+        if ([w standardWindowButton:titlebarButtons[i]].isHidden)
+            s.hiddenTitlebarButtons |= NSUInteger(1) << i;
+    }
     s.shadow = w.hasShadow;
     s.toolbar = w.toolbar;
     s.toolbarVisible = w.toolbar.isVisible;
@@ -174,46 +189,63 @@ static MXWindowSnapshot *remember(NSWindow *w) {
 }
 static void hideTitlebar(NSWindow *w) {
     if (!w || !w.isVisible || w.isMiniaturized || w.attachedSheet || w == NSApp.modalWindow) return;
-    if (!(w.styleMask & NSWindowStyleMaskTitled)) return;
-    if (w.styleMask & NSWindowStyleMaskFullScreen) return; // do not interfere with macOS fullscreen
+    if (!(w.styleMask & NSWindowStyleMaskTitled) || findSnapshot(w)) return;
+    if (w.styleMask & NSWindowStyleMaskFullScreen) return;
     remember(w);
     NSRect frame = w.frame;
+    NSRect content = [w contentRectForFrameRect:frame];
     @try {
-        // Remove both parts of the host window chrome in ONE style change.
-        // Do not touch the plug-in NSView, mouse events, delegates or geometry
-        // constraints. A plug-in may still request programmatic window sizes.
-        w.styleMask = (w.styleMask & ~(NSWindowStyleMaskTitled |
-                                      NSWindowStyleMaskFullSizeContentView |
-                                      NSWindowStyleMaskResizable));
-        [w setFrame:frame display:YES animate:NO];
-    } @catch (NSException *exception) {
-        (void)exception;
-    }
+        if (w == resolveMain()) {
+            w.styleMask &= ~(NSWindowStyleMaskTitled | NSWindowStyleMaskFullSizeContentView |
+                             NSWindowStyleMaskResizable);
+            if (!NSEqualRects(w.frame, frame)) [w setFrame:frame display:YES animate:NO];
+            return;
+        }
+
+        // SWELL can move a VST editor outside its host when the titled bit
+        // changes. Draw content through a transparent titlebar instead.
+        w.titlebarAppearsTransparent = YES;
+        w.titleVisibility = NSWindowTitleHidden;
+        w.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
+        w.styleMask = (w.styleMask | NSWindowStyleMaskFullSizeContentView) &
+                      ~NSWindowStyleMaskResizable;
+        for (NSWindowButton button : titlebarButtons)
+            [w standardWindowButton:button].hidden = YES;
+        NSRect target = [w frameRectForContentRect:content];
+        if (!NSEqualRects(w.frame, target)) [w setFrame:target display:YES animate:NO];
+    } @catch (__unused NSException *exception) {}
 }
-static void restoreOne(MXWindowSnapshot *s, bool restorePosition) {
+static void restoreOne(MXWindowSnapshot *s) {
     NSWindow *w = s.window;
     if (!w) return;
     @try {
-        NSRect currentFrame = w.frame;
-        // Restore the original titlebar and native-resize flags together.
+        NSRect frame = w.frame;
+        NSRect content = [w contentRectForFrameRect:frame];
+        const bool isMain = w == resolveMain();
         w.styleMask = s.style;
         w.titleVisibility = s.titleVisibility;
         w.titlebarAppearsTransparent = s.transparentTitle;
+        w.titlebarSeparatorStyle = s.titlebarSeparator;
         w.hasShadow = s.shadow;
-        w.minSize = s.minSize;
-        w.contentMinSize = s.contentMinSize;
+        for (NSUInteger i = 0; i < sizeof(titlebarButtons) / sizeof(titlebarButtons[0]); ++i)
+            [w standardWindowButton:titlebarButtons[i]].hidden = (s.hiddenTitlebarButtons >> i) & 1;
+        if (isMain) {
+            w.minSize = s.minSize;
+            w.contentMinSize = s.contentMinSize;
+        }
         if (s.toolbar && w.toolbar == s.toolbar) w.toolbar.visible = s.toolbarVisible;
-        [w setFrame:(restorePosition ? s.frame : currentFrame) display:YES animate:NO];
-    } @catch (NSException *exception) {
-        (void)exception;
-    }
+        // With the preset row hidden, AppKit can use the oversized root
+        // to size the new frame. Keep the visible editor viewport instead.
+        NSRect target = isMain ? frame : [w frameRectForContentRect:content];
+        if (!NSEqualRects(w.frame, target)) [w setFrame:target display:YES animate:NO];
+    } @catch (__unused NSException *exception) {}
 }
 // Restoring a single focused window must not restore its initial screen
 // coordinates: Move Until Click and manual positioning must be preserved.
 static void restoreTitlebarOnly(NSWindow *w) {
     MXWindowSnapshot *snapshot = findSnapshot(w);
     if (!snapshot) return;
-    restoreOne(snapshot, false);
+    restoreOne(snapshot);
     [savedWindows removeObject:snapshot];
 }
 static bool shouldHideChrome(NSWindow *w) {
@@ -228,7 +260,7 @@ static void applyChrome(NSWindow *w) {
 static void showAll() {
     automaticHide = false;
     [chromeOverrides removeAllObjects];
-    for (MXWindowSnapshot *s in [savedWindows reverseObjectEnumerator]) restoreOne(s, false);
+    for (MXWindowSnapshot *s in [savedWindows reverseObjectEnumerator]) restoreOne(s);
     [savedWindows removeAllObjects];
 }
 // Each REAPER FX instance has a stable 16-byte GUID, unlike its NSWindow pointer.
@@ -319,9 +351,110 @@ static void saveFocusedPresetState(NSWindow *w, BOOL hidden) {
         api.setExtState(kSettingsSection, key.UTF8String, stored.UTF8String, true);
     }
 }
+// Monitoring FX geometry guard. Some SWELL builds persist an additional
+// title/preset row as if it belonged to the plug-in editor each time the FX
+// window is reconstructed. Preserve the unmodified TITLED frame dimensions
+// across reconstruction and correct *only* integral row-sized drift. Never
+// modify a borderless live window here, and never touch the plug-in NSViews.
+// This is deliberately limited to Monitoring FX rather than all floating FX.
+static NSString *monitoringGeometryKey(NSWindow *w) {
+    if (!isMonitoringFXEditor(w)) return nil;
+    NSString *title = [[w.title lowercaseString] stringByTrimmingCharactersInSet:
+                        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    const char *bytes = title.UTF8String;
+    if (!bytes || !*bytes) return nil;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(bytes); *p; ++p) {
+        hash ^= *p;
+        hash *= UINT64_C(1099511628211);
+    }
+    return [NSString stringWithFormat:@"monitor_geometry_v1_%016llx", (unsigned long long)hash];
+}
+static bool loadMonitoringGeometry(NSWindow *w, CGFloat *width, CGFloat *height) {
+    if (!api.getExtState || !width || !height) return false;
+    NSString *key = monitoringGeometryKey(w);
+    if (!key) return false;
+    const char *stored = api.getExtState(kSettingsSection, key.UTF8String);
+    NSString *value = stored ? [NSString stringWithUTF8String:stored] : nil;
+    NSArray<NSString *> *parts = [value componentsSeparatedByString:@","];
+    if (parts.count != 2) return false;
+    double a = [parts[0] doubleValue], b = [parts[1] doubleValue];
+    if (!std::isfinite(a) || !std::isfinite(b) || a < 180.0 || b < 110.0 ||
+        a > 10000.0 || b > 10000.0) return false;
+    *width = a;
+    *height = b;
+    return true;
+}
+static void saveMonitoringGeometry(NSWindow *w, CGFloat width, CGFloat height) {
+    if (!api.setExtState || width < 180.0 || height < 110.0 ||
+        !std::isfinite(width) || !std::isfinite(height)) return;
+    NSString *key = monitoringGeometryKey(w);
+    if (!key) return;
+    NSString *value = [NSString stringWithFormat:@"%.3f,%.3f", (double)width, (double)height];
+    api.setExtState(kSettingsSection, key.UTF8String, value.UTF8String, true);
+}
+// Accept a one-to-several row drift, but do not override arbitrary geometry:
+// a different plug-in layout or an intentionally different size wins.
+static bool matchesRepeatedHostRow(CGFloat extra, CGFloat row) {
+    if (!std::isfinite(row) || row < 16.0 || row > 90.0 || extra < 14.0) return false;
+    for (int count = 1; count <= 8; ++count) {
+        CGFloat expected = count * row;
+        if (std::fabs(extra - expected) <= std::max<CGFloat>(2.0, count * 0.75))
+            return true;
+    }
+    return false;
+}
+static void reconcileMonitoringHeightBeforeChrome(NSWindow *w) {
+    if (!w || !w.isVisible || w.isMiniaturized ||
+        !(w.styleMask & NSWindowStyleMaskTitled) ||
+        (w.styleMask & NSWindowStyleMaskFullScreen)) return;
+    NSRect frame = w.frame;
+    NSView *content = w.contentView;
+    if (!content || NSWidth(frame) < 180.0 || NSHeight(frame) < 150.0 ||
+        NSWidth(content.bounds) < 160.0 || NSHeight(content.bounds) < 100.0)
+        return; // Wait for a proper SWELL FX view; never calibrate a placeholder.
+
+    CGFloat savedWidth = 0, savedHeight = 0;
+    if (!loadMonitoringGeometry(w, &savedWidth, &savedHeight)) {
+        // Calibrate once from the untouched host frame. User-initiated editor
+        // resizes below can subsequently update this reference explicitly.
+        saveMonitoringGeometry(w, NSWidth(frame), NSHeight(frame));
+        return;
+    }
+    if (std::fabs(savedWidth - NSWidth(frame)) > 2.0) return;
+    CGFloat extra = NSHeight(frame) - savedHeight;
+    if (extra < 14.0) return;
+    NSRect contentRect = [w contentRectForFrameRect:frame];
+    CGFloat titleHeight = NSHeight(frame) - NSHeight(contentRect);
+    CGFloat stripHeight = presetCropHeight(w);
+    if (!matchesRepeatedHostRow(extra, titleHeight) &&
+        !matchesRepeatedHostRow(extra, stripHeight)) return;
+    // Resize BEFORE changing NSWindow.styleMask. Never run the v33 path that
+    // resized a borderless window after SWELL had already relaid out its editor.
+    NSRect corrected = frame;
+    corrected.size.height = savedHeight;
+    @try { [w setFrame:corrected display:YES animate:NO]; }
+    @catch (__unused NSException *exception) {}
+}
+static void rememberMonitoringHeightFromUserResize(NSWindow *w) {
+    if (!isMonitoringFXEditor(w) || !w.isVisible) return;
+    NSEvent *event = NSApp.currentEvent;
+    if (!event || event.type != NSEventTypeLeftMouseDragged || event.window != w)
+        return; // Host/layout/project changes must never become the new baseline.
+    MXPresetPanelSnapshot *preset = findPresetSnapshot(w);
+    CGFloat originalTitledHeight = NSHeight(w.frame);
+    if (preset) originalTitledHeight += preset.appliedWindowCrop;
+    saveMonitoringGeometry(w, NSWidth(w.frame), originalTitledHeight);
+}
+
 static void trackWindow(NSWindow *w, bool focused) {
     if (!w || w == resolveMain() || isHostFXChainWindow(w)) return;
     bool newlyDiscovered = ![knownFXWindows containsObject:w];
+    // Normalize a new Monitoring FX editor while it still has its ORIGINAL
+    // titled host frame. Once chrome is removed its content coordinate system
+    // has changed; a late setFrame can collapse SWELL's editor (v33).
+    if (newlyDiscovered && isMonitoringFXEditor(w))
+        reconcileMonitoringHeightBeforeChrome(w);
     [knownFXWindows addObject:w];
     // Scanning FX is NOT a focus change. In particular, do not replace the
     // user's selected Monitoring FX with a random Track FX just because the
@@ -1106,17 +1239,49 @@ static void restorePresetPanel(MXPresetPanelSnapshot *snap) {
     NSView *root = snap.contentRoot;
     if (!w || !root || w.contentView != root) return;
     @try {
-        // Restore REAPER's geometry and mask without changing view identity.
-        w.minSize = snap.previousMinSize;
+        // Restore the frame BEFORE its original minimum constraints. Restoring
+        // a larger minSize first can grow the compact window automatically;
+        // adding the crop afterward would then increase it a second time.
+        NSRect frame = w.frame;
+        // Do not accumulate height if the host rejected or partially applied
+        // the original shrink. This also respects a plug-in's later resize.
+        frame.size.height += snap.appliedWindowCrop;
+        [w setFrame:frame display:YES animate:NO];
         w.contentMinSize = snap.previousContentMinSize;
         root.autoresizingMask = (NSAutoresizingMaskOptions)snap.originalAutoresizingMask;
-        NSRect frame = w.frame;
-        frame.size.height += snap.removedHeight;
-        [w setFrame:frame display:YES animate:NO];
         NSRect visible = [w contentRectForFrameRect:w.frame];
         [root setFrame:NSMakeRect(0.0, 0.0, NSWidth(visible), NSHeight(visible))];
         [root setNeedsDisplay:YES];
     } @catch (__unused NSException *exception) {}
+}
+// When REAPER closes an FX window, its host may still be collecting the
+// current editor geometry. Restoring the full window height at WillClose adds
+// the hidden preset strip to the saved editor height, causing a one-strip
+// increase every time that Monitoring FX is recreated/reopened.
+// Discard only the temporary oversized viewport; never enlarge a closing window.
+static void releaseClosingPresetViewport(MXPresetPanelSnapshot *snap) {
+    NSWindow *w = snap.window;
+    NSView *root = snap.contentRoot;
+    if (!w || !root || w.contentView != root) return;
+    @try {
+        root.autoresizingMask = (NSAutoresizingMaskOptions)snap.originalAutoresizingMask;
+        NSRect visible = [w contentRectForFrameRect:w.frame];
+        if (NSWidth(visible) > 0.0 && NSHeight(visible) > 0.0) {
+            NSRect target = NSMakeRect(0.0, 0.0, NSWidth(visible), NSHeight(visible));
+            NSRect current = root.frame;
+            if (std::fabs(NSHeight(current) - NSHeight(target)) > 0.5 ||
+                std::fabs(NSWidth(current) - NSWidth(target)) > 0.5 ||
+                std::fabs(NSMinX(current)) > 0.5 || std::fabs(NSMinY(current)) > 0.5)
+                [root setFrame:target];
+        }
+        // minSize/contentMinSize stay untouched: restoring the old minimum
+        // may itself grow the closing window. The NSWindow is being destroyed.
+    } @catch (__unused NSException *exception) {}
+}
+static void releaseAllClosingPresetViewports() {
+    for (MXPresetPanelSnapshot *snap in [savedPresetPanels reverseObjectEnumerator])
+        releaseClosingPresetViewport(snap);
+    [savedPresetPanels removeAllObjects];
 }
 static void restoreAllPresetPanels() {
     for (MXPresetPanelSnapshot *snap in [savedPresetPanels reverseObjectEnumerator])
@@ -1177,9 +1342,9 @@ static bool hidePresetPanel(NSWindow *w) {
     snap.window = w;
     snap.contentRoot = root;  // preserve the exact SWELL root throughout the toggle
     snap.originalAutoresizingMask = root.autoresizingMask;
-    snap.previousMinSize = w.minSize;
     snap.previousContentMinSize = w.contentMinSize;
     snap.removedHeight = crop;
+    snap.appliedWindowCrop = 0.0;
     [savedPresetPanels addObject:snap];
     @try {
         // A genuine SWELL HWND is often the contentView itself. AppKit's
@@ -1187,15 +1352,15 @@ static bool hidePresetPanel(NSWindow *w) {
         // REAPER event routing, focus, and plug-in editor layout.
         root.autoresizingMask = NSViewNotSizable;
 
-        NSSize minimum = w.minSize;
-        minimum.height = std::max(0.0, minimum.height - crop);
-        w.minSize = minimum;
-        minimum = w.contentMinSize;
+        // AppKit derives minSize from contentMinSize and the current chrome.
+        NSSize minimum = w.contentMinSize;
         minimum.height = std::max(0.0, minimum.height - crop);
         w.contentMinSize = minimum;
         NSRect compact = previous;
         compact.size.height -= crop; // keep the bottom edge in place
         [w setFrame:compact display:YES animate:NO];
+        // Track actual shrink before any further host/view layout takes place.
+        snap.appliedWindowCrop = std::max<CGFloat>(0.0, NSHeight(previous) - NSHeight(w.frame));
         updatePresetViewport(snap);
 
         NSRect visible = [w contentRectForFrameRect:w.frame];
@@ -1284,7 +1449,7 @@ static void toggleFocusedChrome() {
     if (!(w.styleMask & NSWindowStyleMaskTitled) && !snapshot) {
         return;
     }
-    if (snapshot && !(w.styleMask & NSWindowStyleMaskTitled)) {
+    if (snapshot) {
         // Local Show even if global automatic hiding remains ON.
         [chromeOverrides setObject:@NO forKey:w];
         restoreTitlebarOnly(w);
@@ -1311,7 +1476,7 @@ static int toggleState(int command) {
     if (command == focusedToggleID) {
         NSWindow *w = NSApp.keyWindow;
         if (!w || isHostFXChainWindow(w) || !(w == resolveMain() || [knownFXWindows containsObject:w])) return -1;
-        return findSnapshot(w) && !(w.styleMask & NSWindowStyleMaskTitled) ? 1 : 0;
+        return findSnapshot(w) ? 1 : 0;
     }
     return -1;
 }
@@ -1362,6 +1527,7 @@ static void clearObservers() {
     if (updateObserver) { [center removeObserver:updateObserver]; updateObserver = nil; }
     if (resizeObserver) { [center removeObserver:resizeObserver]; resizeObserver = nil; }
     if (focusMouseObserver) { [NSEvent removeMonitor:focusMouseObserver]; focusMouseObserver = nil; }
+    if (terminateObserver) { [center removeObserver:terminateObserver]; terminateObserver = nil; }
 }
 } // namespace
 
@@ -1413,9 +1579,13 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
     presetWindowKeys = [NSMapTable weakToStrongObjectsMapTable];
     mainExplicitlySelected = false;
     lastFXChosen = false;
+    applicationTerminating = false;
     loadPresetSettings();
     @autoreleasepool {
         NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+        terminateObserver = [center addObserverForName:NSApplicationWillTerminateNotification object:NSApp queue:nil usingBlock:^(__unused NSNotification *note) {
+            applicationTerminating = true;
+        }];
         keyObserver = [center addObserverForName:NSWindowDidBecomeKeyNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
             NSWindow *w = note.object;
             if (w == resolveMain()) { applyChrome(w); }
@@ -1454,7 +1624,12 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
             if (w == lastFX) { lastFX = nil; lastFXChosen = false; }
             if (w == mainWindow) mainWindow = nil;
             MXPresetPanelSnapshot *preset = findPresetSnapshot(w);
-            if (preset) { restorePresetPanel(preset); [savedPresetPanels removeObject:preset]; }
+            if (preset) {
+                // REAPER can persist Monitoring FX sizing in WillClose.
+                // Do not add the cropped host-row height back to that window.
+                releaseClosingPresetViewport(preset);
+                [savedPresetPanels removeObject:preset];
+            }
             [presetOverrides removeObjectForKey:w];
             [presetWindowKeys removeObjectForKey:w];
             MXWindowSnapshot *s = findSnapshot(w);
@@ -1466,6 +1641,7 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
             NSWindow *w = note.object;
             MXPresetPanelSnapshot *preset = findPresetSnapshot(w);
             if (preset) updatePresetViewport(preset);
+            rememberMonitoringHeightFromUserResize(w);
         }];
         updateObserver = [center addObserverForName:NSApplicationDidUpdateNotification object:nil queue:nil usingBlock:^(__unused NSNotification *note) {
             // An FX window can receive NSWindowDidBecomeKey before REAPER updates
@@ -1521,9 +1697,16 @@ extern "C" void MixolveFXWindowsStop() {
     if (!regWindow) return;
     @autoreleasepool {
         stopMoving();
+        const bool shuttingDown = applicationTerminating || (NSApp && !NSApp.isRunning);
         clearObservers();
-        restoreAllPresetPanels();
-        showAll();
+        if (shuttingDown) {
+            // Do not grow FX windows during REAPER's save/termination sequence.
+            releaseAllClosingPresetViewports();
+        } else {
+            // Manual extension unload while REAPER is still running.
+            restoreAllPresetPanels();
+            showAll();
+        }
         savedWindows = nil;
         chromeOverrides = nil;
         knownFXWindows = nil;
