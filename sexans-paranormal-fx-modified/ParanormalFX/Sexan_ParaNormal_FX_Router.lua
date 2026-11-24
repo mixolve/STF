@@ -54,44 +54,13 @@ else
     end
 end
 
--- JSFX paths
-local saike_splitter_path = reaper_path .. "/Effects/Saike Tools/Basics/BandSplitter.jsfx"
-local lfos_path           = reaper_path .. "/Effects/ReaTeam JSFX/Modulation/snjuk2_LFO.jsfx"
-local splitters_path      = reaper_path ..
-    "/Effects/Suzuki Scripts/lewloiwc's Splitter Suite/lewloiwc_frequency_splitter.jsfx"
-
-
 --local fx_browser_script_path = "C:/Users/Gokily/Documents/ReaGit/ReaScripts/FX/Sexan_FX_Browser_ParserV7.lua" -- DEV
 --local fm_script_path         = "C:/Users/Gokily/Documents/ReaGit/ReaScripts/ImGui_Tools/FileManager.lua" -- DEV
 local fx_browser_script_path = reaper_path .. "/Scripts/Sexan_Scripts/FX/Sexan_FX_Browser_ParserV7.lua"
 local fm_script_path         = reaper_path .. "/Scripts/Sexan_Scripts/ImGui_Tools/FileManager.lua"
 
-function ThirdPartyDeps()
-    local reapack_process
-    local repos = {
-        { name = "Saike Tools",    url = 'https://raw.githubusercontent.com/JoepVanlier/JSFX/master/index.xml' },
-        { name = "Suzuki Scripts", url = "https://github.com/Suzuki-Re/Suzuki-Scripts/raw/master/index.xml" },
-    }
-
-    for i = 1, #repos do
-        local retinfo, url, enabled, autoInstall = r.ReaPack_GetRepositoryInfo(repos[i].name)
-        if not retinfo then
-            retval, error = r.ReaPack_AddSetRepository(repos[i].name, repos[i].url, true, 0)
-            reapack_process = true
-        end
-    end
-
-    -- ADD NEEDED REPOSITORIES
-    if reapack_process then
-        --r.ShowMessageBox("Added Third-Party ReaPack Repositories", "ADDING REPACK REPOSITORIES", 0)
-        r.ReaPack_ProcessQueue(true)
-        reapack_process = nil
-    end
-end
-
 local function CheckDeps()
-    --'Sexan FX Browser Parser V7' OR 'Sexan ImGui FileManager' OR 'Dear Imgui' OR 'Saike 4-pole BandSplitter'
-    ThirdPartyDeps()
+    -- Third-party LFO/splitter JSFX are optional; only core UI modules block startup.
     local deps = {}
 
     if not r.ImGui_GetVersion then
@@ -102,16 +71,6 @@ local function CheckDeps()
     end
     if not r.file_exists(fm_script_path) then
         deps[#deps + 1] = '"Sexan ImGui FileManager"'
-    end
-    if not r.file_exists(lfos_path) then
-        deps[#deps + 1] = '"Snjuk2"'
-    end
-    if not r.file_exists(splitters_path) then
-        deps[#deps + 1] = [["lewloiwc's Splitter Suite"]]
-    end
-    if not r.file_exists(saike_splitter_path) then
-        deps[#deps + 1] = '"Saike 4-pole BandSplitter"'
-        r.SetExtState("PARANORMALFX2", "UPDATEFX", "true", false)
     end
 
     if #deps ~= 0 then
@@ -124,7 +83,6 @@ end
 if CheckDeps() then return end
 
 dofile(r.GetResourcePath() .. '/Scripts/ReaTeam Extensions/API/imgui.lua')('0.8.7')
---if ThirdPartyDeps() then return end
 
 ctx = ImGui.CreateContext('ParaNormalFX Router')
 

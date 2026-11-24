@@ -788,106 +788,56 @@ ADD_FX_MARKED = ADD_FX_MARKED or {}
 local ADD_FX_LONG_PRESS
 local ADD_FX_LONG_PRESS_TIME = 0.3
 local ADD_FX_CLOSE_POPUP
-local ADD_FX_ITEM_RECTS = {}
 
-local function StartAddFxLongPress(key, x1, y1, x2, y2)
-    ADD_FX_LONG_PRESS = {
-        key = key,
-        start = r.time_precise(),
-        x1 = x1,
-        y1 = y1,
-        x2 = x2,
-        y2 = y2,
-    }
-end
-
-local function AddFxSelectableLabel(label, key, hide_text)
-    local visible, id = label:match("^(.-)(##.*)$")
-    if not visible then
-        visible = label
-        id = "##add_fx_" .. key
-    end
-    return (hide_text and "" or visible) .. id
-end
-
-local function DrawAddFxSelectable(label, fx_name, selected, width)
-    local key = tostring(fx_name or label)
-    local marked = ADD_FX_MARKED[key]
-    local held = ADD_FX_LONG_PRESS and ADD_FX_LONG_PRESS.key == key
-    local mouse_x, mouse_y = r.ImGui_GetMousePos(ctx)
-    local previous_rect = ADD_FX_ITEM_RECTS[key]
-    if not held and previous_rect and r.ImGui_IsMouseClicked(ctx, 0)
-        and mouse_x >= previous_rect.x1 and mouse_x <= previous_rect.x2
-        and mouse_y >= previous_rect.y1 and mouse_y <= previous_rect.y2 then
-        StartAddFxLongPress(
-            key,
-            previous_rect.window_x1,
-            previous_rect.y1,
-            previous_rect.window_x2,
-            previous_rect.y2
-        )
-        held = true
-    end
-    local prompt = held and r.time_precise() - ADD_FX_LONG_PRESS.start >= ADD_FX_LONG_PRESS_TIME
-    local hovered = previous_rect and mouse_x >= previous_rect.x1 and mouse_x <= previous_rect.x2
-        and mouse_y >= previous_rect.y1 and mouse_y <= previous_rect.y2
-    local highlighted = selected or hovered or held
-    local fill = prompt and 0x222222FF or (highlighted and 0xBBBBBBFF or 0x222222FF)
-    local text = highlighted and not prompt and 0x000000FF or 0xFFFFFFFF
+local function DrawAddFxSelectable(label, fx_name, selected)
+    local id = "###add_fx_" .. fx_name
+    local marked = ADD_FX_MARKED[fx_name]
+    local visible_label = marked and "✓ " .. label or label
     local _, row_y = r.ImGui_GetCursorScreenPos(ctx)
     local _, spacing_y = r.ImGui_GetStyleVar(ctx, r.ImGui_StyleVar_ItemSpacing())
-    DrawPopupRowBackground(ctx, fill, row_y - spacing_y / 2,
-        row_y + r.ImGui_GetTextLineHeight(ctx) + spacing_y / 2)
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), text)
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Header(), fill)
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderHovered(), fill)
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderActive(), fill)
+    local top = row_y - spacing_y / 2
+    local bottom = row_y + r.ImGui_GetTextLineHeight(ctx) + spacing_y / 2
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), 0)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderHovered(), 0)
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_HeaderActive(), 0)
     local flags = r.ImGui_SelectableFlags_DontClosePopups()
-    local clicked = ParaSelectable(ctx, AddFxSelectableLabel(label, key, prompt), true, flags)
-    r.ImGui_PopStyleColor(ctx, 4)
+    local clicked = r.ImGui_Selectable(ctx, visible_label .. id, false, flags)
+    r.ImGui_PopStyleColor(ctx, 3)
 
-    local item_x1, item_y1 = r.ImGui_GetItemRectMin(ctx)
-    local item_x2, item_y2 = r.ImGui_GetItemRectMax(ctx)
-    local window_x = r.ImGui_GetWindowPos(ctx)
-    local window_w = r.ImGui_GetWindowSize(ctx)
-    if prompt then
-        local prompt_text = marked and "UNMARK?" or "MARK?"
-        ParaDrawText(r.ImGui_GetWindowDrawList(ctx), prompt_text,
-            window_x,item_y1,window_x+window_w-1,item_y2,0xFFFFFFFF,0.5,false,1)
-    end
-    ADD_FX_ITEM_RECTS[key] = {
-        x1 = item_x1,
-        y1 = item_y1,
-        x2 = item_x2,
-        y2 = item_y2,
-        window_x1 = window_x,
-        window_x2 = window_x + window_w,
-    }
-    local inside_item = mouse_x >= item_x1 and mouse_x <= item_x2 and mouse_y >= item_y1 and mouse_y <= item_y2
-    local item_active = r.ImGui_IsItemActive(ctx)
-    if inside_item and not held and (r.ImGui_IsMouseClicked(ctx, 0) or item_active) then
-        StartAddFxLongPress(key, window_x, item_y1, window_x + window_w, item_y2)
-        held = true
+    local hovered = r.ImGui_IsItemHovered(ctx)
+    local held = r.ImGui_IsItemActive(ctx)
+    if held and r.ImGui_IsItemClicked(ctx, 0) then
+        ADD_FX_LONG_PRESS = { id = id, start = r.time_precise() }
     end
 
-    if held then
-        clicked = false
-        local active = ADD_FX_LONG_PRESS
-        local release_inside = mouse_x >= active.x1 and mouse_x <= active.x2
-            and mouse_y >= active.y1 and mouse_y <= active.y2
-        if r.ImGui_IsMouseReleased(ctx, 0) then
-            local is_long = r.time_precise() - active.start >= ADD_FX_LONG_PRESS_TIME
-            if release_inside then
-                if is_long then
-                    ADD_FX_MARKED[key] = not ADD_FX_MARKED[key] or nil
-                    if StoreSettings then StoreSettings() end
-                else
-                    clicked = true
-                end
+    local press = ADD_FX_LONG_PRESS
+    local released = clicked and r.ImGui_IsMouseReleased(ctx, 0)
+    local prompt = false
+    if press and press.id == id and (held or released) then
+        local drag_x, drag_y = r.ImGui_GetMouseDragDelta(ctx, 0)
+        press.dragged = press.dragged or r.ImGui_IsMouseDragging(ctx, 0) or drag_x ~= 0 or drag_y ~= 0
+        local long_press = r.time_precise() - press.start >= ADD_FX_LONG_PRESS_TIME
+        prompt = held and hovered and long_press and not press.dragged
+        if released and (long_press or press.dragged) then
+            clicked = false
+            if not press.dragged then
+                marked = not marked
+                ADD_FX_MARKED[fx_name] = marked or nil
+                StoreSettings()
+                visible_label = marked and "✓ " .. label or label
             end
-            ADD_FX_LONG_PRESS = nil
         end
     end
+
+    local highlighted = not prompt and (selected or hovered or held)
+    if highlighted then
+        DrawPopupRowBackground(ctx, 0xBBBBBBFF, top, bottom)
+    end
+    local window_x = r.ImGui_GetWindowPos(ctx)
+    local window_w = r.ImGui_GetWindowSize(ctx)
+    local text = prompt and (marked and "UNMARK?" or "MARK?") or visible_label
+    ParaDrawText(r.ImGui_GetWindowDrawList(ctx), text, window_x, top, window_x + window_w - 1, bottom - 1,
+        highlighted and 0x000000FF or 0xFFFFFFFF, prompt and 0.5 or 0, false, 1)
 
     if clicked then
         ADD_FX_CLOSE_POPUP = true
@@ -1007,7 +957,7 @@ local function FilterBox()
         if r.ImGui_BeginChild(ctx, "##popupp", MAX_FX_SIZE, filter_h, false, r.ImGui_WindowFlags_AlwaysUseWindowPadding()) then
             r.ImGui_SetCursorPosY(ctx, spacing_y * 0.5)
             for i = 1, #filtered_fx do
-                local visible_name = DisplaySearchFxName(filtered_fx[i].display or filtered_fx[i].name) .. "##filtered_fx" .. i
+                local visible_name = DisplaySearchFxName(filtered_fx[i].display or filtered_fx[i].name)
                 if DrawAddFxSelectable(visible_name, filtered_fx[i].name, i == ADDFX_Sel_Entry) then
                     AddFX(filtered_fx[i].name)
                     r.ImGui_CloseCurrentPopup(ctx)
@@ -1107,8 +1057,7 @@ local function DrawItems(tbl, main_cat_name)
                         name = name:gsub(" %(" .. Literalize(tbl[i].name) .. "%)", "")
                     end
                     local display_name = DisplayUpperName(name)
-                    local tw = r.ImGui_CalcTextSize(ctx, display_name)
-                    if DrawAddFxSelectable(display_name, tbl[i].fx[j], nil, tw > 500 and 500 or tw) then
+                    if DrawAddFxSelectable(display_name, tbl[i].fx[j]) then
                         AddFX(tbl[i].fx[j])
                     end
                     DndAddFX_SRC(tbl[i].fx[j])
@@ -2108,7 +2057,7 @@ local function SerialInsertParaLane(tbl, i, w, h, x, y)
             color = SineColorBrightness(COLOR["sine_anim"], color)
         end
         if not tbl[i].no_draw_e then
-            DrawListButton(TABLER_ICON.enclose, color, false, true, nil, nil, is_active)
+            DrawListButton(TABLER_ICON.plus, color, false, true, nil, nil, is_active)
         end
         Tooltip("INSERT NEW SERIAL\nENCLOSE BOTH TO CONT")
         return true

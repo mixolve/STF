@@ -88,6 +88,7 @@ static NSMutableArray *savedWindows = nil;
 // hides a window that the user just showed using Focused Toggle.
 static NSMapTable<NSWindow *, NSNumber *> *chromeOverrides = nil;
 static NSHashTable<NSWindow *> *knownFXWindows = nil;
+static NSHashTable<NSButton *> *hiddenFXPins = nil;
 static NSMutableArray *savedPresetPanels = nil;
 // Weak keys avoid retaining REAPER FX windows after they are closed.
 static NSMapTable<NSWindow *, NSNumber *> *presetOverrides = nil;
@@ -509,6 +510,28 @@ static void rememberMonitoringHeightFromUserResize(NSWindow *w) {
     saveMonitoringGeometry(w, NSWidth(w.frame), originalTitledHeight);
 }
 
+static void hideFXPinInSuperview(NSView *parent, Class pinCellClass) {
+    for (NSView *view in parent.subviews) {
+        if (![view isKindOfClass:NSButton.class] || view.isHidden) continue;
+        NSButton *button = (NSButton *)view;
+        if (![button.cell isKindOfClass:pinCellClass]) continue;
+        [hiddenFXPins addObject:button];
+        button.hidden = YES;
+    }
+}
+
+static void hideFXPin(NSWindow *w) {
+    Class pinCellClass = NSClassFromString(@"SWELL_TopmostButton");
+    if (!pinCellClass || !w.isVisible) return;
+
+    // SWELL attaches the pin beside the close button, or beside the
+    // content view when the window has no native close button.
+    NSView *titlebar = [w standardWindowButton:NSWindowCloseButton].superview;
+    NSView *frame = w.contentView.superview;
+    hideFXPinInSuperview(titlebar, pinCellClass);
+    if (frame != titlebar) hideFXPinInSuperview(frame, pinCellClass);
+}
+
 static void trackWindow(NSWindow *w, bool focused) {
     if (!w || w == resolveMain() || isHostFXChainWindow(w)) return;
     bool newlyDiscovered = ![knownFXWindows containsObject:w];
@@ -536,6 +559,7 @@ static void trackWindow(NSWindow *w, bool focused) {
     }
     applyChrome(w);
     applyPreset(w);
+    hideFXPin(w);
 }
 // Resolve an FX window from REAPER's current *or most recent* focused FX.
 // For input/Monitoring FX the 0x1000000 FX flag must be left intact.
@@ -1646,6 +1670,7 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
     savedWindows = [NSMutableArray new];
     chromeOverrides = [NSMapTable weakToStrongObjectsMapTable];
     knownFXWindows = [NSHashTable weakObjectsHashTable];
+    hiddenFXPins = [NSHashTable weakObjectsHashTable];
     savedPresetPanels = [NSMutableArray new];
     presetOverrides = [NSMapTable weakToStrongObjectsMapTable];
     presetWindowKeys = [NSMapTable weakToStrongObjectsMapTable];
@@ -1665,7 +1690,8 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
         keyObserver = [center addObserverForName:NSWindowDidBecomeKeyNotification object:nil queue:nil usingBlock:^(NSNotification *note) {
             NSWindow *w = note.object;
             if (w == resolveMain()) { applyChrome(w); }
-            else if (w && !isHostFXChainWindow(w)) {
+            else if (isHostFXChainWindow(w)) hideFXPin(w);
+            else if (w) {
                 // Track actual floating FX windows when they become key,
                 // before GetFocusedFX2 has necessarily updated its record.
                 if (isFloatingFXWindow(w)) trackWindow(w, true);
@@ -1728,6 +1754,10 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
             CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
             if (now < nextUpdate) return;
             nextUpdate = now + 0.4;
+            for (NSWindow *window in NSApp.windows) {
+                if ([knownFXWindows containsObject:window] || isHostFXChainWindow(window))
+                    hideFXPin(window);
+            }
             // Keep the original REAPER contentView crop-height taller than
             // the visible window content rect. No replacement NSView or
             // plug-in-view reparenting is permitted.
@@ -1768,6 +1798,7 @@ fail:
     toggleID = moveID = focusedToggleID = presetToggleID = presetAllToggleID = 0; hook1 = hook2 = toggleHookInstalled = false;
     chromeOverrides = nil;
     knownFXWindows = nil;
+    hiddenFXPins = nil;
     savedPresetPanels = nil;
     presetOverrides = nil;
     presetWindowKeys = nil;
@@ -1789,12 +1820,14 @@ extern "C" void MixolveFXWindowsStop() {
             restoreAllPresetPanels();
             if (NSView *view = arrangeScrollbarView) setArrangeScrollbarsVisible(view, true);
             showAll();
+            for (NSButton *pin in hiddenFXPins) pin.hidden = NO;
         }
         arrangeScrollbarView = nil;
         arrangeScrollbarsHidden = false;
         savedWindows = nil;
         chromeOverrides = nil;
         knownFXWindows = nil;
+        hiddenFXPins = nil;
         savedPresetPanels = nil;
         presetOverrides = nil;
         presetWindowKeys = nil;
