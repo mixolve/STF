@@ -18,7 +18,7 @@
 #include <cstring>
 #include <cctype>
 
-static const char *kMixolveToolbarBuild="mixolve_toolbar_v88_arrange_scrollbars";
+static const char *kMixolveToolbarBuild="mixolve_toolbar_v93_take_volume_absolute";
 // The action ID matches the other REAPER action registrations; the visible
 // name uses the same lowercase mixolve_custom-view prefix.
 struct MXReadoutAction { int section; const char *id; const char *name; };

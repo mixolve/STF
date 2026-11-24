@@ -9,6 +9,13 @@
 #include <locale>
 
 namespace mx {
+struct TrackVolumeRange {
+    double minDb = -72.0;
+    double maxDb = 12.0;
+};
+inline double volumeGainFromDb(double db) {
+    return std::pow(10.0, db / 20.0);
+}
 inline std::string trackVolumeDisplay(double linear) {
     if (!(linear > 0.0) || !std::isfinite(linear)) return "MUTED";
     double db = 20.0 * std::log10(linear);
@@ -22,7 +29,7 @@ inline std::string trackVolumeDisplay(double linear) {
     std::replace(display.begin(), display.end(), ',', '.');
     return display;
 }
-inline bool parseTrackVolume(const std::string &source, double &linear) {
+inline bool parseTrackVolume(const std::string &source, double &linear, TrackVolumeRange range) {
     auto first = source.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return false;
     auto last = source.find_last_not_of(" \t\r\n");
@@ -46,9 +53,7 @@ inline bool parseTrackVolume(const std::string &source, double &linear) {
     if (!(input >> db)) return false;
     char extra = '\0';
     if ((input >> extra) || !input.eof() || !std::isfinite(db)) return false;
-    // Avoid unbounded amplification or denormals from mistyped values.
-    if (db < -150.0 || db > 60.0) return false;
-    double v = std::pow(10.0, db / 20.0);
+    double v = volumeGainFromDb(std::clamp(db, range.minDb, range.maxDb));
     if (!std::isfinite(v) || v <= 0.0) return false;
     linear = v;
     return true;

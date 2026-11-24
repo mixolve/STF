@@ -39,6 +39,7 @@ NSObject<NSTextFieldDelegate> *delegate;
 bool finishing,swallowRelease;
 // Track volume readout is a separate TCP field; it never uses the envelope editor.
 double (*trackNumber)(void*,const char*)=nullptr;
+void *(*volumeConfigVar)(const char*,int*)=nullptr;
 bool (*setTrackNumber)(void*,const char*,double)=nullptr;
 // Draw within REAPER's native window, in a topmost child NSView. A separate
 // NSWindow/NSPanel is composed independently and can flicker against SWELL's
@@ -494,7 +495,7 @@ void volumeDiagnostic(const char *message, NSRect rect){
  previous=key;
  NSString *path=[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/mixolve-custom-view-volume.log"];
  FILE *fp=fopen(path.fileSystemRepresentation,"a");
- if(fp){fprintf(fp,"v85: %s rect=(%.0f %.0f %.0f %.0f)\n",message,
+ if(fp){fprintf(fp,"v91: %s rect=(%.0f %.0f %.0f %.0f)\n",message,
        rect.origin.x,rect.origin.y,rect.size.width,rect.size.height);fclose(fp);}
 }
 BOOL positionVolumeEditor(){
@@ -589,6 +590,57 @@ void updateVolumeReadout(void *t,NSView *hostView,NSRect location,bool hidden){
  }
  item.canvas.hidden=hidden;
 }
+double volumeFaderSetting(const char *name,double fallback){
+ int size=0;
+ const void *value=volumeConfigVar?volumeConfigVar(name,&size):nullptr;
+ if(!value||size!=sizeof(double))return fallback;
+ const double db=*static_cast<const double*>(value);
+ return std::isfinite(db)?db:fallback;
+}
+mx::TrackVolumeRange volumeFaderRange(){
+ mx::TrackVolumeRange range;
+ range.minDb=volumeFaderSetting("sliderminv",range.minDb);
+ range.maxDb=volumeFaderSetting("slidermaxv",range.maxDb);
+ return range.minDb>=-160.0&&range.maxDb<=60.0&&range.minDb<range.maxDb?
+     range:mx::TrackVolumeRange{};
+}
+void applyTrackVolume(void *p,void *anchor,double target,double factor,mx::TrackVolumeRange range){
+ struct Change {void *track;double gain;};
+ std::vector<Change> gains{{anchor,trackNumber(anchor,"D_VOL")}};
+ if(factor!=1.0&&trackNumber(anchor,"I_SELECTED")!=0.0){
+  for(int i=0,n=countTracks(p);i<n;i++){
+   void *t=getTrack(p,i);
+   if(t&&t!=anchor&&trackNumber(t,"I_SELECTED")!=0.0)
+    gains.push_back({t,trackNumber(t,"D_VOL")});
+  }
+ }
+ const double minimum=mx::volumeGainFromDb(range.minDb);
+ const double maximum=mx::volumeGainFromDb(range.maxDb);
+ if(factor>0.0){
+  double minFactor=0.0,maxFactor=INFINITY;
+  for(const auto &entry:gains){
+   if(entry.gain<=0.0||!std::isfinite(entry.gain))continue;
+   minFactor=std::max(minFactor,minimum/entry.gain);
+   maxFactor=std::min(maxFactor,maximum/entry.gain);
+  }
+  // Limit the whole selection at the first fader bound. Older, out-of-range
+  // values may span more than the entire fader range; clamp those individually.
+  if(minFactor<=maxFactor)factor=std::clamp(factor,minFactor,maxFactor);
+ }
+ std::vector<Change> changes;
+ for(const auto &entry:gains){
+  const double shifted=entry.gain>0.0?entry.gain*factor:
+      entry.track==anchor?target:0.0;
+  if(!std::isfinite(entry.gain)||std::isnan(shifted))continue;
+  const double limited=shifted>0.0?std::clamp(shifted,minimum,maximum):0.0;
+  if(limited!=entry.gain)changes.push_back({entry.track,limited});
+ }
+ if(changes.empty())return;
+ undoBegin(p);
+ for(const auto &change:changes)setTrackNumber(change.track,"D_VOL",change.gain);
+ undoEnd(p,changes.size()==1?"Set track volume":"Adjust selected track volumes",1);
+ dirty(p);adjust(false);arrange();
+}
 bool finishVolume(bool commit){
  if(!volumeField||volumeFinishing)return true;
  NSTextField *closing=volumeField;
@@ -596,7 +648,8 @@ bool finishVolume(bool commit){
    [(NSTextView*)closing.currentEditor string]:closing.stringValue;
  bool unchanged=entered&&initialVolumeText==entered.UTF8String;
  double target=initialVolume;
- if(commit&&!unchanged&&!mx::parseTrackVolume(entered.UTF8String?:"",target)){
+ const auto range=volumeFaderRange();
+ if(commit&&!unchanged&&!mx::parseTrackVolume(entered.UTF8String?:"",target,range)){
   NSBeep();return false;
  }
  volumeFinishing=true;
@@ -606,10 +659,10 @@ bool finishVolume(bool commit){
     valid(volumeProject,volumeTrack,"MediaTrack*")&&
     trackNumber&&setTrackNumber&&
     trackNumber(volumeTrack,"D_VOL")==initialVolume&&target!=initialVolume){
-  undoBegin(volumeProject);
-  setTrackNumber(volumeTrack,"D_VOL",target);
-  undoEnd(volumeProject,"Set track volume",1);
-  dirty(volumeProject);adjust(false);arrange();
+  // A zero-gain reference has no finite dB offset. Entering a finite
+  // level there restores just that track and leaves the others in place.
+  const double factor=initialVolume>0.0?target/initialVolume:1.0;
+  applyTrackVolume(volumeProject,volumeTrack,target,factor,range);
  }
  NSWindow *w=volumeWindow;
  // Restore the painted value before detaching the field. Waiting for the
@@ -741,7 +794,52 @@ void open(void *t,NSView *view,NSWindow *w){
  if(![w makeFirstResponder:editor]){finish(false);return;}
  selectionStyle();editor.selectedRange=NSMakeRange(0,editor.string.length);
 }
+void *volumeTrackAt(void *p,NSWindow *w,NSPoint point,NSRect &rect){
+ if(!p||!w||!trackNumber||!setTrackNumber||!countTracks||!getTrack)return nullptr;
+ for(int i=0,n=countTracks(p);i<n;i++){
+  void *t=getTrack(p,i);
+  NSRect r=volumeRect(t);
+  if(contains(r,point)&&volumeVisibleAtPoint(t,r)&&volumeHostForScreenRect(r).window==w){
+   rect=r;
+   return t;
+  }
+ }
+ return nullptr;
+}
+bool scrollTrackVolume(NSEvent *event){
+ const double vertical=event.scrollingDeltaY;
+ if(!std::isfinite(vertical)||vertical==0.0||
+    std::abs(vertical)<std::abs(event.scrollingDeltaX))return false;
+ NSWindow *w=event.window;
+ if(!w)return false;
+ NSPoint point=[w convertPointToScreen:event.locationInWindow];
+ void *p=project(-1,nullptr,0);
+ if(!p)return false;
+ void *anchor=nullptr;
+ if(volumeField&&w==volumeWindow&&p==volumeProject&&contains(volumeEditorScreenRect,point)){
+  anchor=volumeTrack;
+ }else{
+  anchor=getTrackFromPoint((int)floor(point.x),(int)floor(point.y),nullptr);
+  if(!anchor)return false;
+  NSRect rect=volumeRect(anchor);
+  if(!contains(rect,point)||volumeHostForScreenRect(rect).window!=w)return false;
+ }
+ if(!valid(p,anchor,"MediaTrack*"))return false;
+
+ // Ignore gesture momentum so the gain stops changing when the fingers stop.
+ if(event.momentumPhase!=NSEventPhaseNone)return true;
+ if(volumeField&&!finishVolume(true))return true;
+ if(project(-1,nullptr,0)!=p||!valid(p,anchor,"MediaTrack*"))return true;
+
+ constexpr double stepDb=0.01;
+ const double delta=std::clamp(vertical*stepDb,-6.0,6.0);
+ const double current=trackNumber(anchor,"D_VOL");
+ const double factor=mx::volumeGainFromDb(delta);
+ applyTrackVolume(p,anchor,current*factor,factor,volumeFaderRange());
+ return true;
+}
 bool mouseEvent(NSEvent *event){
+ if(event.type==NSEventTypeScrollWheel)return scrollTrackVolume(event);
  if(event.type==NSEventTypeKeyDown&&volumeField){
   if(event.window==volumeWindow||(!event.window&&NSApp.keyWindow==volumeWindow)){
    unsigned short key=event.keyCode;
@@ -822,24 +920,16 @@ bool mouseEvent(NSEvent *event){
  NSView *root=event.window.contentView,*target=[root hitTest:[root convertPoint:event.locationInWindow fromView:nil]];
  // A single press can open the editor. All presses on the readout are
  // consumed before SWELL receives them.
- if(trackNumber&&setTrackNumber&&countTracks&&getTrack){
-  void *p=project(-1,nullptr,0);
-  if(p){
-   for(int i=0,n=countTracks(p);i<n;i++){
-    void *t=getTrack(p,i);NSRect r=volumeRect(t);
-    if(contains(r,point)&&volumeVisibleAtPoint(t,r)&&
-       volumeHostForScreenRect(r).window==event.window){
-     // AppKit can carry a click count over from a nearby control. A
-     // readout that is not editing can always accept its first press.
-     volumePress={t,p,r,event.windowNumber,false};
-     return true;
-    }
-   }
-  }
+ void *p=project(-1,nullptr,0);
+ NSRect rect=NSZeroRect;
+ if(void *t=volumeTrackAt(p,event.window,point,rect)){
+  // AppKit can carry a click count over from a nearby control. A
+  // readout that is not editing can always accept its first press.
+  volumePress={t,p,rect,event.windowNumber,false};
+  return true;
  }
  NSString *targetClass=NSStringFromClass(target.class);
  if(![targetClass containsString:@"REAPERTCPDisplay"]&&![targetClass containsString:@"TCPReadoutCanvas"])return false;
- void *p=project(-1,nullptr,0);
  for(int i=0;i<countTracks(p);i++){
   void *t=getTrack(p,i);NSRect label=labelRect(t,"P_UI_RECT:tcp.label");
   if(contains(label,point)&&event.clickCount>=2){open(t,target,event.window);swallowRelease=true;return true;}
@@ -928,6 +1018,7 @@ extern "C" bool MixolveTrackNameEntry(ep::Info *info){
  LOAD(trackNumber,"GetMediaTrackInfo_Value");LOAD(setTrackNumber,"SetMediaTrackInfo_Value");
  LOAD(getTrackFromPoint,"GetTrackFromPoint");LOAD(mainHwnd,"GetMainHwnd");
 #undef LOAD
+ volumeConfigVar=reinterpret_cast<decltype(volumeConfigVar)>(info->get("get_config_var"));
  if(!info->reg("timer",(void*)tick))return false;
  host=*info;delegate=[MXTCPNameDelegate new];volumeDelegate=[MXTCPVolumeDelegate new];MixolveSetTCPNameMouseFilter(mouseEvent);return true;
 }

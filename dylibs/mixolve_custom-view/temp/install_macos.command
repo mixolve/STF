@@ -38,6 +38,7 @@ SOURCES=(
   "$SOURCE_DIR/keyboard.mm" "$SOURCE_DIR/track-name.mm"
   "$SOURCE_DIR/readout-cell.mm" "$SOURCE_DIR/readout-baseline.cpp"
   "$SOURCE_DIR/objc-hooks.mm" "$SOURCE_DIR/fx-windows.mm"
+  "$SOURCE_DIR/take-volume-actions.cpp"
 )
 HEADERS=(
   "$SOURCE_DIR/cpu-status.hpp" "$SOURCE_DIR/fx-windows.hpp"

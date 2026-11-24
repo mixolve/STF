@@ -9,12 +9,14 @@ extern "C" int MixolveEnvelopeEntry(ep::Info *);
 extern "C" void MixolveKeyboardStart();
 extern "C" void MixolveKeyboardStop();
 extern "C" bool MixolveTrackNameEntry(ep::Info *);
+extern "C" bool MixolveTakeVolumeEntry(ep::Info *);
 
 static bool started = false;
 static bool windowsStarted = false;
 static bool envelopeStarted = false;
 static bool keyboardStarted = false;
 static bool trackNameStarted = false;
+static bool takeVolumeStarted = false;
 
 extern "C" __attribute__((visibility("default")))
 int ReaperPluginEntry(void *module, ep::Info *info) {
@@ -22,12 +24,13 @@ int ReaperPluginEntry(void *module, ep::Info *info) {
     @autoreleasepool {
         if (!info) {
             if (started) {
+                if (takeVolumeStarted) MixolveTakeVolumeEntry(nullptr);
                 if (windowsStarted) MixolveFXWindowsStop();
                 if (trackNameStarted) MixolveTrackNameEntry(nullptr);
                 if (envelopeStarted) MixolveEnvelopeEntry(nullptr);
                 if (keyboardStarted) MixolveKeyboardStop();
             }
-            started = windowsStarted = envelopeStarted = keyboardStarted = trackNameStarted = false;
+            started = windowsStarted = envelopeStarted = keyboardStarted = trackNameStarted = takeVolumeStarted = false;
             return 0;
         }
         if (started) return 1;
@@ -40,16 +43,17 @@ int ReaperPluginEntry(void *module, ep::Info *info) {
         MixolveKeyboardStart();
         keyboardStarted = true;
         trackNameStarted = MixolveTrackNameEntry(info);
+        takeVolumeStarted = MixolveTakeVolumeEntry(info);
 
-        started = windowsStarted || envelopeStarted || trackNameStarted;
+        started = windowsStarted || envelopeStarted || trackNameStarted || takeVolumeStarted;
         // A runtime load marker distinguishes an old/misplaced .dylib from
         // a drawing failure. In particular, the TCP hook must have started.
         NSString *loadPath = [NSHomeDirectory() stringByAppendingPathComponent:
             @"Library/Logs/mixolve-custom-view-load.log"];
         if (FILE *fp = fopen(loadPath.fileSystemRepresentation, "a")) {
-            fprintf(fp, "v88: loaded=%d tcp=%d toolbar=%d fx=%d\n",
+            fprintf(fp, "v93: loaded=%d tcp=%d toolbar=%d fx=%d take_volume=%d\n",
                 (int)started, (int)trackNameStarted, (int)envelopeStarted,
-                (int)windowsStarted);
+                (int)windowsStarted, (int)takeVolumeStarted);
             fclose(fp);
         }
         if (!started) {
