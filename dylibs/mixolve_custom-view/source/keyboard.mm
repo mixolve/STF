@@ -5,6 +5,7 @@
 #import <AppKit/AppKit.h>
 #import <Carbon/Carbon.h>
 #import <objc/runtime.h>
+#include "fx-windows.hpp"
 
 extern "C" void MixolveUpdateTCPVolumePointer(NSEvent *);
 extern "C" void MixolveUpdateTCPVolumeScroll(NSEvent *,bool);
@@ -108,6 +109,7 @@ void sendEvent(id self, SEL selector, NSEvent *event) {
         NSEvent *forward = shortcutEvent(event);
         MixolveUpdateTCPVolumeScroll(forward, false);
         ((void (*)(id, SEL, NSEvent *))originalSend)(self, selector, forward);
+        if (forward.type == NSEventTypeScrollWheel) MixolveRefreshArrangeScrollbarsAfterWheel();
         MixolveUpdateTCPVolumeScroll(forward, true);
     }
     // AppKit and SWELL can both reset the pointer during mouse dispatch.

@@ -1,5 +1,5 @@
 /*
- * mixolve_after-fx — two native REAPER Main-section actions.
+ * mixolve_after-fx — native REAPER Main-section actions.
  * macOS ARM64. No SWS, Lua polling, or legacy command IDs.
  *
  * Only unlocked items with one or two takes are processed.
@@ -14,9 +14,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-/* Builtin types keep the source cross-compilable without a macOS SDK. */
-extern void *malloc(size_t);
-extern void free(void *);
+#include <stdlib.h>
 
 #define REAPER_PLUGIN_VERSION 0x20E
 
@@ -254,6 +252,8 @@ static void run_after_fx(int apply_action) {
     free(states);
 }
 
+#include "fast_render.h"
+
 /* Both dispatchers are needed: custom_action routes keyboard and Action List
  * invocations via hookcommand2; hookcommand covers Main_OnCommand callers. */
 static bool dispatch_action(int command) {
@@ -265,7 +265,7 @@ static bool dispatch_action(int command) {
         run_after_fx(ACT_APPLY_FX_MONO);
         return true;
     }
-    return false;
+    return dispatch_fast_action(command);
 }
 
 static bool hook_command(int command, int flag) {
@@ -288,6 +288,7 @@ int ReaperPluginEntry(void *instance, reaper_plugin_info_t *info) {
         if (register_plugin) {
             register_plugin("-hookcommand2", (void *)hook_command2);
             register_plugin("-hookcommand", (void *)hook_command);
+            unregister_fast_actions();
             register_plugin("-custom_action", (void *)&action_reg_mono);
             register_plugin("-custom_action", (void *)&action_reg_stereo);
         }
@@ -330,6 +331,7 @@ int ReaperPluginEntry(void *instance, reaper_plugin_info_t *info) {
         register_plugin("-hookcommand", (void *)hook_command);
         goto fail;
     }
+    register_fast_actions(info);
     register_plugin("ext_name", (void *)"mixolve_after-fx");
     return 1;
 fail:

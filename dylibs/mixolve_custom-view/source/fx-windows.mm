@@ -9,6 +9,7 @@
 #import <dispatch/dispatch.h>
 #import <ApplicationServices/ApplicationServices.h>
 #include "fx-windows.hpp"
+#include "objc-hooks.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -25,9 +26,13 @@ static MXCustomAction kMove = {0, "MIXOLVE_CUSTOMVIEW_WINDOWS_MOVE", "mixolve_cu
 static MXCustomAction kFocusedToggle = {0, "MIXOLVE_CUSTOMVIEW_WINDOWS_FOCUSED_TOGGLE", "mixolve_custom-view: toggle titlebar + native resize focused"};
 static MXCustomAction kPresetToggle = {0, "MIXOLVE_CUSTOMVIEW_WINDOWS_PRESET_FOCUSED_TOGGLE", "mixolve_custom-view: toggle preset panel focused"};
 static MXCustomAction kPresetAllToggle = {0, "MIXOLVE_CUSTOMVIEW_WINDOWS_PRESET_ALL_TOGGLE", "mixolve_custom-view: toggle preset panels (fx)"};
+static MXCustomAction kArrangeScrollbarsToggle = {
+    0, "MIXOLVE_CUSTOMVIEW_ARRANGE_SCROLLBARS_TOGGLE", "mixolve_custom-view: toggle arrange scrollbars"
+};
 
 struct MXAPI {
     void *(*mainHwnd)() = nullptr;
+    signed char (*showScrollBar)(void *, int, signed char) = nullptr;
     int (*focused)(int *, int *, int *) = nullptr;
     // Modern REAPER API: indices differ from deprecated GetFocusedFX2().
     bool (*touchedOrFocused)(int, int *, int *, int *, int *, int *) = nullptr;
@@ -55,8 +60,13 @@ static int (*regWindow)(const char *, void *) = nullptr;
 static int toggleID = 0, moveID = 0, focusedToggleID = 0, presetToggleID = 0, presetAllToggleID = 0;
 static bool hook1 = false, hook2 = false, toggleHookInstalled = false, automaticHide = true;
 static bool automaticPresetHide = false;
+static int arrangeScrollbarsToggleID = 0;
+static bool arrangeScrollbarsHidden = false;
+static __weak NSView *arrangeScrollbarView = nil;
+static bool applyingArrangeScrollbars = false;
 static unsigned long long presetGeneration = 0;
 static const char *kSettingsSection = "mixolve_custom-view";
+static const char *kArrangeScrollbarsKey = "arrange_scrollbars_hidden_v1";
 static const char *kPresetAllKey = "preset_all_hidden_v1";
 static const char *kPresetGenerationKey = "preset_override_generation_v1";
 static __weak NSWindow *movingWindow = nil;
@@ -157,6 +167,58 @@ static NSWindow *resolveMain() {
     if (!w && api.mainHwnd) w = fromSwellHandle(api.mainHwnd());
     if (w) mainWindow = w;
     return w;
+}
+static NSView *resolveArrangeView() {
+    void *main = api.mainHwnd ? api.mainHwnd() : nullptr;
+    auto swell = mx::findSwellAPI();
+    using GetDlgItem = void *(*)(void *, int);
+    auto getDlgItem = swell ? reinterpret_cast<GetDlgItem>(swell("GetDlgItem")) : nullptr;
+    if (!main || !getDlgItem) return nil;
+
+    constexpr int arrangeControlID = 1000;
+    id control = (__bridge id)getDlgItem(main, arrangeControlID);
+    return [control isKindOfClass:NSView.class] && [(NSView *)control window] == resolveMain()
+        ? control : nil;
+}
+static bool setArrangeScrollbarsVisible(NSView *view, bool visible) {
+    constexpr int bothScrollbars = 3; // SB_BOTH
+    applyingArrangeScrollbars = true;
+    const bool changed = api.showScrollBar((__bridge void *)view, bothScrollbars, visible) != 0;
+    applyingArrangeScrollbars = false;
+    if (changed) [view setNeedsDisplay:YES];
+    return changed;
+}
+static bool arrangeScrollbarsHaveInsets(NSView *view) {
+    struct SwellRect { int left, top, right, bottom; };
+    using GetRect = void (*)(void *, SwellRect *);
+    auto swell = mx::findSwellAPI();
+    if (!swell) return false;
+    auto getClient = reinterpret_cast<GetRect>(swell("GetClientRect"));
+    auto getContent = reinterpret_cast<GetRect>(swell("GetWindowContentViewRect"));
+    if (!getClient || !getContent) return false;
+    SwellRect client{}, content{};
+    void *hwnd = (__bridge void *)view;
+    getClient(hwnd, &client);
+    getContent(hwnd, &content);
+    return std::abs(client.right - client.left) < std::abs(content.right - content.left) ||
+           std::abs(client.bottom - client.top) < std::abs(content.bottom - content.top);
+}
+static void applyArrangeScrollbarSetting() {
+    if (!arrangeScrollbarsToggleID || !arrangeScrollbarsHidden || applyingArrangeScrollbars) return;
+    NSView *view = resolveArrangeView();
+    if (view && (view != arrangeScrollbarView || arrangeScrollbarsHaveInsets(view)) &&
+        setArrangeScrollbarsVisible(view, false))
+        arrangeScrollbarView = view;
+}
+static void toggleArrangeScrollbars() {
+    NSView *view = resolveArrangeView();
+    if (!view || !setArrangeScrollbarsVisible(view, arrangeScrollbarsHidden)) return;
+    arrangeScrollbarsHidden = !arrangeScrollbarsHidden;
+    arrangeScrollbarView = arrangeScrollbarsHidden ? view : nil;
+    if (api.setExtState)
+        api.setExtState(kSettingsSection, kArrangeScrollbarsKey,
+                        arrangeScrollbarsHidden ? "1" : "0", true);
+    if (api.refreshToolbar) api.refreshToolbar(0, arrangeScrollbarsToggleID);
 }
 static MXWindowSnapshot *findSnapshot(NSWindow *w) {
     for (MXWindowSnapshot *s in savedWindows) if (s.window == w) return s;
@@ -1467,6 +1529,8 @@ static void toggleChrome() {
     if (api.refreshToolbar && focusedToggleID > 0) api.refreshToolbar(0, focusedToggleID);
 }
 static int toggleState(int command) {
+    if (arrangeScrollbarsToggleID && command == arrangeScrollbarsToggleID)
+        return arrangeScrollbarsHidden ? 1 : 0;
     if (command == toggleID) return automaticHide ? 1 : 0;
     if (command == presetAllToggleID) return automaticPresetHide ? 1 : 0;
     if (command == presetToggleID) {
@@ -1486,6 +1550,7 @@ static void runCommand(int command) {
     else if (command == focusedToggleID) toggleFocusedChrome();
     else if (command == presetToggleID) toggleFocusedPresetPanel();
     else if (command == presetAllToggleID) toggleAllPresetPanels();
+    else if (command == arrangeScrollbarsToggleID) toggleArrangeScrollbars();
 }
 // REAPER can expose multiple command-hook paths. If both report the *same*
 // user action, executing a toggle twice immediately cancels the first call.
@@ -1505,7 +1570,7 @@ static void runWindowCommandOnce(int command) {
     runCommand(command);
 }
 static bool dispatchCommand(int command) {
-    if (!regWindow || (command != toggleID && command != moveID && command != focusedToggleID && command != presetToggleID && command != presetAllToggleID)) return false;
+    if (!regWindow || command <= 0 || (command != arrangeScrollbarsToggleID && command != toggleID && command != moveID && command != focusedToggleID && command != presetToggleID && command != presetAllToggleID)) return false;
     if ([NSThread isMainThread]) {
         @autoreleasepool { runWindowCommandOnce(command); }
     } else {
@@ -1531,10 +1596,15 @@ static void clearObservers() {
 }
 } // namespace
 
+void MixolveRefreshArrangeScrollbarsAfterWheel() {
+    applyArrangeScrollbarSetting();
+}
+
 extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
     if (!info || !info->get || !info->reg) return false;
     if (regWindow) return true;
     api.mainHwnd = reinterpret_cast<decltype(api.mainHwnd)>(info->get("GetMainHwnd"));
+    api.showScrollBar = reinterpret_cast<decltype(api.showScrollBar)>(info->get("CoolSB_ShowScrollBar"));
     api.focused = reinterpret_cast<decltype(api.focused)>(info->get("GetFocusedFX2"));
     api.touchedOrFocused = reinterpret_cast<decltype(api.touchedOrFocused)>(info->get("GetTouchedOrFocusedFX"));
     api.project = reinterpret_cast<decltype(api.project)>(info->get("EnumProjects"));
@@ -1567,6 +1637,8 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
     if (presetToggleID <= 0) goto fail;
     presetAllToggleID = regWindow("custom_action", &kPresetAllToggle);
     if (presetAllToggleID <= 0) goto fail;
+    if (api.showScrollBar)
+        arrangeScrollbarsToggleID = std::max(0, regWindow("custom_action", &kArrangeScrollbarsToggle));
     hook2 = regWindow("hookcommand2", reinterpret_cast<void *>(onCommand2)) != 0;
     hook1 = regWindow("hookcommand", reinterpret_cast<void *>(onCommand)) != 0;
     if (!hook1 && !hook2) goto fail;
@@ -1581,6 +1653,10 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
     lastFXChosen = false;
     applicationTerminating = false;
     loadPresetSettings();
+    if (arrangeScrollbarsToggleID && api.getExtState) {
+        const char *value = api.getExtState(kSettingsSection, kArrangeScrollbarsKey);
+        arrangeScrollbarsHidden = value && std::strcmp(value, "1") == 0;
+    }
     @autoreleasepool {
         NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
         terminateObserver = [center addObserverForName:NSApplicationWillTerminateNotification object:NSApp queue:nil usingBlock:^(__unused NSNotification *note) {
@@ -1642,8 +1718,11 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
             MXPresetPanelSnapshot *preset = findPresetSnapshot(w);
             if (preset) updatePresetViewport(preset);
             rememberMonitoringHeightFromUserResize(w);
+            if (arrangeScrollbarsHidden && w == resolveMain()) applyArrangeScrollbarSetting();
         }];
         updateObserver = [center addObserverForName:NSApplicationDidUpdateNotification object:nil queue:nil usingBlock:^(__unused NSNotification *note) {
+            // REAPER can restore the bars when it updates the scroll range.
+            applyArrangeScrollbarSetting();
             // An FX window can receive NSWindowDidBecomeKey before REAPER updates
             // its own focused-FX record. Retry on normal UI updates, not a timer.
             CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -1671,6 +1750,7 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
             }
         }];
         hideAll(); // Main REAPER window now hides immediately on startup.
+        applyArrangeScrollbarSetting();
     }
     return true;
 fail:
@@ -1678,6 +1758,8 @@ fail:
     if (toggleHookInstalled) regWindow("-toggleaction", reinterpret_cast<void *>(toggleState));
     if (hook1) regWindow("-hookcommand", reinterpret_cast<void *>(onCommand));
     if (hook2) regWindow("-hookcommand2", reinterpret_cast<void *>(onCommand2));
+    if (arrangeScrollbarsToggleID > 0) regWindow("-custom_action", &kArrangeScrollbarsToggle);
+    arrangeScrollbarsToggleID = 0;
     if (presetAllToggleID > 0) regWindow("-custom_action", &kPresetAllToggle);
     if (presetToggleID > 0) regWindow("-custom_action", &kPresetToggle);
     if (focusedToggleID > 0) regWindow("-custom_action", &kFocusedToggle);
@@ -1705,8 +1787,11 @@ extern "C" void MixolveFXWindowsStop() {
         } else {
             // Manual extension unload while REAPER is still running.
             restoreAllPresetPanels();
+            if (NSView *view = arrangeScrollbarView) setArrangeScrollbarsVisible(view, true);
             showAll();
         }
+        arrangeScrollbarView = nil;
+        arrangeScrollbarsHidden = false;
         savedWindows = nil;
         chromeOverrides = nil;
         knownFXWindows = nil;
@@ -1721,6 +1806,8 @@ extern "C" void MixolveFXWindowsStop() {
     if (toggleHookInstalled) regWindow("-toggleaction", reinterpret_cast<void *>(toggleState));
     if (hook1) regWindow("-hookcommand", reinterpret_cast<void *>(onCommand));
     if (hook2) regWindow("-hookcommand2", reinterpret_cast<void *>(onCommand2));
+    if (arrangeScrollbarsToggleID > 0) regWindow("-custom_action", &kArrangeScrollbarsToggle);
+    arrangeScrollbarsToggleID = 0;
     if (presetAllToggleID > 0) regWindow("-custom_action", &kPresetAllToggle);
     if (presetToggleID > 0) regWindow("-custom_action", &kPresetToggle);
     if (focusedToggleID > 0) regWindow("-custom_action", &kFocusedToggle);

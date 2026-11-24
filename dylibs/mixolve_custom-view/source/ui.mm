@@ -11,7 +11,6 @@
 #include <memory>
 #include <algorithm>
 #include <cmath>
-#include <dlfcn.h>
 #include <set>
 #include <vector>
 #include <string>
@@ -19,7 +18,7 @@
 #include <cstring>
 #include <cctype>
 
-static const char *kMixolveToolbarBuild="mixolve_toolbar_v85_tcp_volume_regular_caret";
+static const char *kMixolveToolbarBuild="mixolve_toolbar_v88_arrange_scrollbars";
 // The action ID matches the other REAPER action registrations; the visible
 // name uses the same lowercase mixolve_custom-view prefix.
 struct MXReadoutAction { int section; const char *id; const char *name; };
@@ -106,7 +105,6 @@ static void mxCollectViews(NSView *root,std::vector<NSView*> &out,int depth){
  for(NSView *child in root.subviews)mxCollectViews(child,out,depth+1);
 }
 struct MXSWELLRect {int left,top,right,bottom;};
-using MXSWELLFunc=void *(*)(const char *);
 using MXSWELLGetWindow=void *(*)(void *,int);
 using MXSWELLGetClassName=int (*)(void *,char *,int);
 using MXSWELLGetRect=bool (*)(void *,MXSWELLRect *);
@@ -121,30 +119,12 @@ static mx::ToolbarRect mxRect(MXSWELLRect r){
 static mx::ToolbarRect mxDownwardRect(NSRect r){
  return {NSMinX(r),-NSMaxY(r),NSMaxX(r),-NSMinY(r)};
 }
-static MXSWELLFunc findSwellAPI(){
- #if defined(__APPLE__)
- id delegate=NSApp.delegate;
- SEL selector=NSSelectorFromString(@"swellGetAPPAPIFunc");
- if(delegate&&[delegate respondsToSelector:selector]){
-  IMP method=[delegate methodForSelector:selector];
-  if(method){using Provider=void *(*)(id,SEL);
-   void *api=((Provider)method)(delegate,selector);if(api)return (MXSWELLFunc)api;}
- }
- #endif
- MXSWELLFunc fn=(MXSWELLFunc)dlsym(RTLD_DEFAULT,"SWELLAPI_GetFunc");
- if(fn)return fn;
- for(const char *name:{"libSwell.dylib","libSwell.so"}){
-  void *lib=dlopen(name,RTLD_LAZY|RTLD_NOLOAD);
-  if(lib&&(fn=(MXSWELLFunc)dlsym(lib,"SWELLAPI_GetFunc")))return fn;
- }
- return nullptr;
-}
 static BOOL resolveMainToolbarScreenRect(void *mainHandle,NSWindow *host,
                                          NSRect *out,NSString **source){
  if(!mainHandle||!host||!host.contentView||!out)return NO;
  std::vector<NSView*> native;
  mxCollectViews(host.contentView,native,0);
- MXSWELLFunc get=findSwellAPI();
+ auto get=mx::findSwellAPI();
  if(get){
   auto childWindow=(MXSWELLGetWindow)get("GetWindow");
   auto className=(MXSWELLGetClassName)get("GetClassName");

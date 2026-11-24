@@ -1,6 +1,27 @@
+#import <AppKit/AppKit.h>
 #include "objc-hooks.hpp"
+#include <dlfcn.h>
 
 namespace mx {
+SwellAPI findSwellAPI(){
+ #if defined(__APPLE__)
+ id delegate=NSApp.delegate;
+ SEL selector=NSSelectorFromString(@"swellGetAPPAPIFunc");
+ if(delegate&&[delegate respondsToSelector:selector]){
+  IMP method=[delegate methodForSelector:selector];
+  if(method){using Provider=void *(*)(id,SEL);
+   void *api=((Provider)method)(delegate,selector);if(api)return (SwellAPI)api;}
+ }
+ #endif
+ SwellAPI fn=(SwellAPI)dlsym(RTLD_DEFAULT,"SWELLAPI_GetFunc");
+ if(fn)return fn;
+ for(const char *name:{"libSwell.dylib","libSwell.so"}){
+  void *lib=dlopen(name,RTLD_LAZY|RTLD_NOLOAD);
+  if(lib&&(fn=(SwellAPI)dlsym(lib,"SWELLAPI_GetFunc")))return fn;
+ }
+ return nullptr;
+}
+
 bool HookRegistry::install(Class klass, SEL selector, IMP replacement) {
     if (!klass || !selector || !replacement) return false;
     for (const Record& entry : records)

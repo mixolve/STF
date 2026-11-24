@@ -5,3 +5,5 @@
 // toggles, Move-until-click, and a focused FX preset-panel toggle.
 extern "C" bool MixolveFXWindowsStart(ep::Info *info);
 extern "C" void MixolveFXWindowsStop();
+
+void MixolveRefreshArrangeScrollbarsAfterWheel();
