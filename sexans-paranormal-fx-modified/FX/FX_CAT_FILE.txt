@@ -1,9 +1,7 @@
 {
  [1] = {
-  name = "ALL PLUGINS",
   list = {
    [1] = {
-    name = "AU",
     fx = {
      [1] = "AU: AUAudioFilePlayer (Apple)",
      [2] = "AU: AUBandpass (Apple)",
@@ -34,17 +32,17 @@
      [27] = "AU: AUSpeechSynthesis (Apple)",
      [28] = "AU: Element FX (Kushview)",
     },
+    name = "AU",
    },
    [2] = {
-    name = "AUi",
     fx = {
      [1] = "AUi: AUMIDISynth (Apple)",
      [2] = "AUi: AUSampler (Apple)",
      [3] = "AUi: DLSMusicDevice (Apple)",
     },
+    name = "AUi",
    },
    [3] = {
-    name = "INSTRUMENTS",
     fx = {
      [1] = "AUi: AUMIDISynth (Apple)",
      [2] = "AUi: AUSampler (Apple)",
@@ -59,15 +57,15 @@
      [11] = "VSTi: ReaSamplOmatic5000 (Cockos)",
      [12] = "VSTi: ReaSynth (Cockos)",
     },
+    name = "INSTRUMENTS",
    },
    [4] = {
-    name = "JS",
     fx = {
      [1] = "JS: Audio To MIDI Drum Trigger [drumtrigger]",
     },
+    name = "JS",
    },
    [5] = {
-    name = "VST",
     fx = {
      [1] = "VST: ReaCast (Cockos)",
      [2] = "VST: ReaComp (Cockos)",
@@ -90,9 +88,9 @@
      [19] = "VST: ReaVoice (Cockos)",
      [20] = "VST: ReaXcomp (Cockos)",
     },
+    name = "VST",
    },
    [6] = {
-    name = "VST3",
     fx = {
      [1] = "VST3: ANA",
      [2] = "VST3: apShaper (apulSoft)",
@@ -114,9 +112,9 @@
      [18] = "VST3: VELA (Sonic Academy)",
      [19] = "VST3: XenoVerb (Audiority)",
     },
+    name = "VST3",
    },
    [7] = {
-    name = "VST3i",
     fx = {
      [1] = "VST3i: Augmented BRASS (Arturia)",
      [2] = "VST3i: Augmented GRAND PIANO (Arturia)",
@@ -126,92 +124,92 @@
      [6] = "VST3i: Phase Plant (Kilohearts)",
      [7] = "VST3i: Synplant (Sonic Charge)",
     },
+    name = "VST3i",
    },
    [8] = {
-    name = "VSTi",
     fx = {
      [1] = "VSTi: ReaSamplOmatic5000 (Cockos)",
      [2] = "VSTi: ReaSynth (Cockos)",
     },
+    name = "VSTi",
    },
   },
+  name = "ALL PLUGINS",
  },
  [2] = {
-  name = "CATEGORY",
   list = {
    [1] = {
-    name = "Analyzer",
     fx = {
      [1] = "VST3: EQ Curve Analyzer 2 (Bertom)",
     },
+    name = "Analyzer",
    },
    [2] = {
-    name = "Delay",
     fx = {
      [1] = "VST: ReaDelay (Cockos)",
     },
+    name = "Delay",
    },
    [3] = {
-    name = "Distortion",
     fx = {
      [1] = "VST3: apShaper (apulSoft)",
      [2] = "VST3: kHs Distortion (Kilohearts)",
      [3] = "VST3: kHs Phase Distortion (Kilohearts)",
     },
+    name = "Distortion",
    },
    [4] = {
-    name = "Dynamics",
     fx = {
      [1] = "VST3: Pro-DS (FabFilter)",
      [2] = "VST: ReaComp (Cockos)",
      [3] = "VST: ReaLimit (Cockos)",
      [4] = "VST: ReaXcomp (Cockos)",
     },
+    name = "Dynamics",
    },
    [5] = {
-    name = "EQ",
     fx = {
      [1] = "VST3: EQ Curve Analyzer 2 (Bertom)",
      [2] = "VST: ReaEQ (Cockos)",
     },
+    name = "EQ",
    },
    [6] = {
-    name = "External",
     fx = {
      [1] = "VST: ReaCast (Cockos)",
      [2] = "VST: ReaInsert (Cockos)",
      [3] = "VST: ReaNINJAM (Cockos)",
      [4] = "VST: ReaStream (Cockos) (8ch)",
     },
+    name = "External",
    },
    [7] = {
-    name = "Gate",
     fx = {
      [1] = "VST: ReaGate (Cockos)",
     },
+    name = "Gate",
    },
    [8] = {
-    name = "MIDI",
     fx = {
      [1] = "VST: ReaControlMIDI (Cockos)",
     },
+    name = "MIDI",
    },
    [9] = {
-    name = "Pitch Correction",
     fx = {
      [1] = "VST: ReaPitch (Cockos)",
     },
+    name = "Pitch Correction",
    },
    [10] = {
-    name = "Restoration",
     fx = {
      [1] = "VST3: De-Feedback (Alpha Labs LLC)",
      [2] = "VST3: RX 12 De-click (iZotope)",
      [3] = "VST3: RX 12 Spectral De-noise (iZotope)",
     },
+    name = "Restoration",
    },
    [11] = {
-    name = "Reverb",
     fx = {
      [1] = "VST3: Temperance Pro (Eventide)",
      [2] = "VST3: ValhallaPlate (Valhalla DSP, LLC)",
@@ -220,22 +218,22 @@
      [5] = "VST: ReaVerb (Cockos)",
      [6] = "VST: ReaVerbate (Cockos)",
     },
+    name = "Reverb",
    },
    [12] = {
-    name = "Sampler",
     fx = {
      [1] = "VSTi: ReaSamplOmatic5000 (Cockos)",
     },
+    name = "Sampler",
    },
    [13] = {
-    name = "Surround",
     fx = {
      [1] = "VST: ReaSurround (Cockos)",
      [2] = "VST: ReaSurroundPan (Cockos)",
     },
+    name = "Surround",
    },
    [14] = {
-    name = "Synth",
     fx = {
      [1] = "VST3i: Augmented BRASS (Arturia)",
      [2] = "VST3i: Augmented GRAND PIANO (Arturia)",
@@ -245,35 +243,35 @@
      [6] = "VST3i: Synplant (Sonic Charge)",
      [7] = "VSTi: ReaSynth (Cockos)",
     },
+    name = "Synth",
    },
    [15] = {
-    name = "Tools",
     fx = {
      [1] = "VST3: splitS (apulSoft)",
      [2] = "VST: ReaFir (FFT EQ+Dynamics Processor) (Cockos)",
      [3] = "VST: ReaVocode (Cockos)",
      [4] = "VST: ReaVoice (Cockos)",
     },
+    name = "Tools",
    },
    [16] = {
-    name = "Tuner",
     fx = {
      [1] = "VST: ReaTune (Cockos)",
     },
+    name = "Tuner",
    },
   },
+  name = "CATEGORY",
  },
  [3] = {
-  name = "DEVELOPER",
   list = {
    [1] = {
-    name = "Alpha Labs LLC",
     fx = {
      [1] = "VST3: De-Feedback (Alpha Labs LLC)",
     },
+    name = "Alpha Labs LLC",
    },
    [2] = {
-    name = "Apple",
     fx = {
      [1] = "AU: AUAudioFilePlayer (Apple)",
      [2] = "AU: AUBandpass (Apple)",
@@ -306,16 +304,16 @@
      [29] = "AUi: AUSampler (Apple)",
      [30] = "AUi: DLSMusicDevice (Apple)",
     },
+    name = "Apple",
    },
    [3] = {
-    name = "apulSoft",
     fx = {
      [1] = "VST3: apShaper (apulSoft)",
      [2] = "VST3: splitS (apulSoft)",
     },
+    name = "apulSoft",
    },
    [4] = {
-    name = "Arturia",
     fx = {
      [1] = "VST3i: Augmented BRASS (Arturia)",
      [2] = "VST3i: Augmented GRAND PIANO (Arturia)",
@@ -323,27 +321,27 @@
      [4] = "VST3i: Augmented VOICES (Arturia)",
      [5] = "VST3i: Augmented WOODWINDS (Arturia)",
     },
+    name = "Arturia",
    },
    [5] = {
-    name = "Audiority",
     fx = {
      [1] = "VST3: XenoVerb (Audiority)",
     },
+    name = "Audiority",
    },
    [6] = {
-    name = "Bertom",
     fx = {
      [1] = "VST3: EQ Curve Analyzer 2 (Bertom)",
     },
+    name = "Bertom",
    },
    [7] = {
-    name = "Celemony",
     fx = {
      [1] = "VST3: Melodyne (Celemony)",
     },
+    name = "Celemony",
    },
    [8] = {
-    name = "Cockos",
     fx = {
      [1] = "VST: ReaCast (Cockos)",
      [2] = "VST: ReaComp (Cockos)",
@@ -368,88 +366,88 @@
      [21] = "VSTi: ReaSamplOmatic5000 (Cockos)",
      [22] = "VSTi: ReaSynth (Cockos)",
     },
+    name = "Cockos",
    },
    [9] = {
-    name = "Denise Audio",
     fx = {
      [1] = "VST3: Poltergate (Denise Audio)",
     },
+    name = "Denise Audio",
    },
    [10] = {
-    name = "Dr. Audio",
     fx = {
      [1] = "VST3: NeuralNote (Dr. Audio)",
     },
+    name = "Dr. Audio",
    },
    [11] = {
-    name = "Eventide",
     fx = {
      [1] = "VST3: Temperance Pro (Eventide)",
     },
+    name = "Eventide",
    },
    [12] = {
-    name = "FabFilter",
     fx = {
      [1] = "VST3: Pro-DS (FabFilter)",
     },
+    name = "FabFilter",
    },
    [13] = {
-    name = "iZotope",
     fx = {
      [1] = "VST3: RX 12 De-click (iZotope)",
      [2] = "VST3: RX 12 Spectral De-noise (iZotope)",
     },
+    name = "iZotope",
    },
    [14] = {
-    name = "Kilohearts",
     fx = {
      [1] = "VST3: kHs Distortion (Kilohearts)",
      [2] = "VST3: kHs Phase Distortion (Kilohearts)",
      [3] = "VST3i: Phase Plant (Kilohearts)",
     },
+    name = "Kilohearts",
    },
    [15] = {
-    name = "Kushview",
     fx = {
      [1] = "AU: Element FX (Kushview)",
     },
+    name = "Kushview",
    },
    [16] = {
-    name = "mixolve",
     fx = {
      [1] = "VST3: NST (mixolve)",
     },
+    name = "mixolve",
    },
    [17] = {
-    name = "Sonic Academy",
     fx = {
      [1] = "VST3: VELA (Sonic Academy)",
     },
+    name = "Sonic Academy",
    },
    [18] = {
-    name = "Sonic Charge",
     fx = {
      [1] = "VST3i: Synplant (Sonic Charge)",
     },
+    name = "Sonic Charge",
    },
    [19] = {
-    name = "Valhalla DSP, LLC",
     fx = {
      [1] = "VST3: ValhallaPlate (Valhalla DSP, LLC)",
     },
+    name = "Valhalla DSP, LLC",
    },
   },
+  name = "DEVELOPER",
  },
  [4] = {
-  name = "FOLDERS",
   list = {
   },
+  name = "FOLDERS",
  },
  [5] = {
-  name = "PLUG-INS",
   list = {
    [1] = {
-    name = "ALL",
     fx = {
      [1] = "VST3: ANA",
      [2] = "VST3: apShaper (apulSoft)",
@@ -478,22 +476,24 @@
      [25] = "VST3i: Phase Plant (Kilohearts)",
      [26] = "VST3i: Synplant (Sonic Charge)",
     },
+    name = "ALL",
    },
    [2] = {
-    name = "COMPONENTS",
     fx = {
     },
+    name = "COMPONENTS",
    },
    [3] = {
-    name = "VST",
     fx = {
     },
+    name = "VST",
    },
    [4] = {
-    name = "VST3",
     fx = {
     },
+    name = "VST3",
    },
   },
+  name = "PLUG-INS",
  },
 }
