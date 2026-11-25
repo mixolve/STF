@@ -6,7 +6,7 @@
 #include "fx-windows.hpp"
 
 extern "C" int MixolveEnvelopeEntry(ep::Info *);
-extern "C" void MixolveKeyboardStart();
+extern "C" void MixolveKeyboardStart(ep::Info *);
 extern "C" void MixolveKeyboardStop();
 extern "C" bool MixolveTrackNameEntry(ep::Info *);
 extern "C" bool MixolveTakeVolumeEntry(ep::Info *);
@@ -40,7 +40,7 @@ int ReaperPluginEntry(void *module, ep::Info *info) {
         // available even if SWS/envelope or rename APIs are unavailable.
         windowsStarted = MixolveFXWindowsStart(info);
         envelopeStarted = MixolveEnvelopeEntry(info) != 0;
-        MixolveKeyboardStart();
+        MixolveKeyboardStart(info);
         keyboardStarted = true;
         trackNameStarted = MixolveTrackNameEntry(info);
         takeVolumeStarted = MixolveTakeVolumeEntry(info);
@@ -51,7 +51,7 @@ int ReaperPluginEntry(void *module, ep::Info *info) {
         NSString *loadPath = [NSHomeDirectory() stringByAppendingPathComponent:
             @"Library/Logs/mixolve-custom-view-load.log"];
         if (FILE *fp = fopen(loadPath.fileSystemRepresentation, "a")) {
-            fprintf(fp, "v95: loaded=%d tcp=%d toolbar=%d fx=%d take_volume=%d\n",
+            fprintf(fp, "v103: loaded=%d tcp=%d toolbar=%d fx=%d take_volume=%d\n",
                 (int)started, (int)trackNameStarted, (int)envelopeStarted,
                 (int)windowsStarted, (int)takeVolumeStarted);
             fclose(fp);

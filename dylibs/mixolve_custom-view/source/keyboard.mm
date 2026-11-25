@@ -1,11 +1,13 @@
 // mixolve_custom-view: keyboard shortcuts in Cyrillic layouts.
 // Convert only non-text Command/Control/Option shortcuts to the equivalent
 // physical key in the current ASCII-capable layout. Ordinary Cyrillic text,
-// IME composition and plugin/text-editor input remain untouched.
+// IME composition and text-editor input remain untouched.
 #import <AppKit/AppKit.h>
 #import <Carbon/Carbon.h>
 #import <objc/runtime.h>
 #include "fx-windows.hpp"
+#include "objc-hooks.hpp"
+#include <cstdint>
 
 extern "C" void MixolveUpdateTCPVolumePointer(NSEvent *);
 extern "C" void MixolveUpdateTCPVolumeLayout(NSEvent *,bool);
@@ -15,6 +17,29 @@ bool (*mouseFilter)(NSEvent *) = nullptr;
 Class appClass = Nil;
 IMP originalSend = nullptr;
 NSMutableDictionary<NSNumber *, NSString *> *normalizedKeys = nil;
+int (*shortcutRegister)(const char *, void *) = nullptr;
+intptr_t (*swellSendMessage)(void *, unsigned int, uintptr_t, intptr_t) = nullptr;
+__weak NSWindow *shortcutFXWindow = nil;
+int fxCloseKey = -1;
+
+// Prefix of SWELL MSG and the REAPER SDK accelerator_register_t layout.
+struct ShortcutMessage { void *hwnd; unsigned int message; };
+struct ShortcutAccelerator {
+    int (*translate)(ShortcutMessage *, ShortcutAccelerator *);
+    bool isLocal;
+    void *user;
+};
+
+int routeFXShortcut(ShortcutMessage *msg, ShortcutAccelerator *) {
+    NSWindow *target = shortcutFXWindow;
+    if (!target || !msg || (msg->message != 0x0100 && msg->message != 0x0104)) return 0;
+    id recipient = (__bridge id)msg->hwnd;
+    if (recipient != target && !([recipient isKindOfClass:NSView.class] &&
+                                 [(NSView *)recipient window] == target)) return 0;
+    // REAPER resolves the shortcut against the current Main action table.
+    return -666;
+}
+ShortcutAccelerator fxAccelerator{routeFXShortcut, true, nullptr};
 
 bool containsCyrillic(NSString *text) {
     if (!text) return false;
@@ -28,12 +53,13 @@ bool containsCyrillic(NSString *text) {
 }
 
 bool editingText(NSEvent *event) {
-    NSResponder *responder = event.window.firstResponder;
-    if (!responder) return false;
-    if ([responder isKindOfClass:[NSTextView class]] ||
-        [responder isKindOfClass:[NSTextField class]] ||
-        [responder conformsToProtocol:@protocol(NSTextInputClient)]) return true;
-    return false;
+    NSWindow *window = event.window ?: NSApp.keyWindow;
+    NSResponder *responder = window.firstResponder;
+    if ([responder isKindOfClass:NSTextView.class] ||
+        [responder isKindOfClass:NSTextField.class]) return true;
+    if (![responder conformsToProtocol:@protocol(NSTextInputClient)]) return false;
+    id<NSTextInputClient> input = (id<NSTextInputClient>)responder;
+    return input.hasMarkedText || input.selectedRange.location != NSNotFound;
 }
 
 // The active Russian layout cannot be used to derive a Latin shortcut key.
@@ -91,12 +117,13 @@ NSEvent *shortcutEvent(NSEvent *event) {
         }
     }
     if (!latin) return event;
+    NSWindow *window = event.window ?: NSApp.keyWindow;
     NSEvent *converted = [NSEvent keyEventWithType:event.type
         location:event.locationInWindow
         modifierFlags:event.modifierFlags
         timestamp:event.timestamp
-        windowNumber:event.windowNumber
-        context:event.context
+        windowNumber:window ? window.windowNumber : event.windowNumber
+        context:nil
         characters:latin
         charactersIgnoringModifiers:latin
         isARepeat:event.isARepeat
@@ -104,12 +131,59 @@ NSEvent *shortcutEvent(NSEvent *event) {
     return converted ?: event;
 }
 
+bool isFXCloseShortcut(NSEvent *event) {
+    constexpr NSEventModifierFlags keyModifiers = NSEventModifierFlagCommand |
+        NSEventModifierFlagControl | NSEventModifierFlagOption | NSEventModifierFlagShift;
+    return (event.modifierFlags & keyModifiers) == NSEventModifierFlagCommand &&
+        [event.charactersIgnoringModifiers.lowercaseString isEqualToString:@"w"];
+}
+
+bool closeFXWithShortcut(NSWindow *window, NSEvent *event) {
+    if (!swellSendMessage) return false;
+    NSView *dialog = window.contentView;
+    if (![dialog respondsToSelector:NSSelectorFromString(@"onSwellMessage:p1:p2:")]) return false;
+
+    // REAPER handles Cmd+W in a dialog as WM_COMMAND / IDCANCEL.
+    fxCloseKey = event.keyCode;
+    [normalizedKeys removeObjectForKey:@(fxCloseKey)];
+    swellSendMessage((__bridge void *)dialog, 0x0111, 2, 0);
+    return true;
+}
+
 void sendEvent(id self, SEL selector, NSEvent *event) {
+    if (fxCloseKey >= 0 && (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp) &&
+        event.keyCode == fxCloseKey) {
+        if (event.type == NSEventTypeKeyDown && event.isARepeat) return;
+        fxCloseKey = -1;
+        if (event.type == NSEventTypeKeyUp) return;
+    }
     if (!mouseFilter || !mouseFilter(event)) {
         NSEvent *forward = shortcutEvent(event);
+        NSWindow *fx = nil;
+        if (forward != event && event.type == NSEventTypeKeyDown) {
+            NSWindow *target = event.window ?: NSApp.keyWindow;
+            if (target == NSApp.keyWindow && MixolveIsFXShortcutWindow(target)) {
+                if (isFXCloseShortcut(forward)) {
+                    if (closeFXWithShortcut(target, forward)) return;
+                } else {
+                    fx = target;
+                }
+            }
+        }
         MixolveUpdateTCPVolumeLayout(forward, false);
+        NSWindow *previousFX = shortcutFXWindow;
+        shortcutFXWindow = fx;
         ((void (*)(id, SEL, NSEvent *))originalSend)(self, selector, forward);
-        if (forward.type == NSEventTypeScrollWheel) MixolveRefreshArrangeScrollbarsAfterWheel();
+        shortcutFXWindow = previousFX;
+        switch (forward.type) {
+            case NSEventTypeScrollWheel:
+            case NSEventTypeLeftMouseDragged:
+            case NSEventTypeLeftMouseUp:
+            case NSEventTypeKeyDown:
+                MixolveRefreshArrangeViewAfterInput();
+                break;
+            default: break;
+        }
         MixolveUpdateTCPVolumeLayout(forward, true);
     }
     // AppKit and SWELL can both reset the pointer during mouse dispatch.
@@ -123,6 +197,11 @@ extern "C" void MixolveSetTCPNameMouseFilter(bool (*filter)(NSEvent *)) {
 
 extern "C" void MixolveKeyboardStop() {
     mouseFilter = nullptr;
+    if (shortcutRegister) shortcutRegister("-accelerator", &fxAccelerator);
+    shortcutRegister = nullptr;
+    swellSendMessage = nullptr;
+    shortcutFXWindow = nil;
+    fxCloseKey = -1;
     [normalizedKeys removeAllObjects];
     normalizedKeys = nil;
     if (!appClass) return;
@@ -133,7 +212,7 @@ extern "C" void MixolveKeyboardStop() {
     appClass = Nil;
 }
 
-extern "C" void MixolveKeyboardStart() {
+extern "C" void MixolveKeyboardStart(ep::Info *info) {
     if (appClass || !NSApp) return;
     Class candidate = object_getClass(NSApp);
     Method method = class_getInstanceMethod(candidate, @selector(sendEvent:));
@@ -143,5 +222,8 @@ extern "C" void MixolveKeyboardStart() {
     originalSend = previous;
     appClass = candidate;
     normalizedKeys = [NSMutableDictionary dictionary];
+    if (info && info->reg && info->reg("accelerator", &fxAccelerator)) shortcutRegister = info->reg;
+    if (auto swell = mx::findSwellAPI())
+        swellSendMessage = reinterpret_cast<decltype(swellSendMessage)>(swell("SendMessage"));
     class_replaceMethod(appClass, @selector(sendEvent:), (IMP)sendEvent, method_getTypeEncoding(method));
 }

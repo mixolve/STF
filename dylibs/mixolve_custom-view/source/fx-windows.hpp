@@ -6,4 +6,9 @@
 extern "C" bool MixolveFXWindowsStart(ep::Info *info);
 extern "C" void MixolveFXWindowsStop();
 
-void MixolveRefreshArrangeScrollbarsAfterWheel();
+void MixolveRefreshArrangeViewAfterInput();
+
+#ifdef __OBJC__
+@class NSWindow;
+bool MixolveIsFXShortcutWindow(NSWindow *window);
+#endif

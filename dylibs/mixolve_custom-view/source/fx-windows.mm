@@ -11,12 +11,14 @@
 #include "fx-windows.hpp"
 #include "objc-hooks.hpp"
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <string>
+#include <string_view>
 
 // Layout matches REAPER's custom_action_register_t (section, unique ID, description).
 struct MXCustomAction { int section; const char *id; const char *name; };
@@ -30,6 +32,10 @@ static MXCustomAction kArrangeScrollbarsToggle = {
     0, "MIXOLVE_CUSTOMVIEW_ARRANGE_SCROLLBARS_TOGGLE", "mixolve_custom-view: toggle arrange scrollbars"
 };
 
+static MXCustomAction kArrangeProjectEndInsetAction = {
+    0, "MIXOLVE_CUSTOMVIEW_ARRANGE_PROJECT_END_SET_INSET", "mixolve_custom-view: set arrange project end inset"
+};
+
 struct MXAPI {
     void *(*mainHwnd)() = nullptr;
     signed char (*showScrollBar)(void *, int, signed char) = nullptr;
@@ -37,6 +43,10 @@ struct MXAPI {
     // Modern REAPER API: indices differ from deprecated GetFocusedFX2().
     bool (*touchedOrFocused)(int, int *, int *, int *, int *, int *) = nullptr;
     void *(*project)(int, char *, int) = nullptr;
+    void *(*projectConfig)(void *, int) = nullptr;
+    void (*arrangeView)(void *, bool, int, int, double *, double *) = nullptr;
+    double (*horizontalZoom)() = nullptr;
+    void *(*actionSection)(int) = nullptr;
     int (*trackCount)(void *) = nullptr;
     void *(*track)(void *, int) = nullptr;
     void *(*master)(void *) = nullptr;
@@ -52,6 +62,8 @@ struct MXAPI {
     void (*refreshToolbar)(int, int) = nullptr;
     const char *(*getExtState)(const char *, const char *) = nullptr;
     void (*setExtState)(const char *, const char *, const char *, bool) = nullptr;
+    bool (*getUserInputs)(const char *, int, const char *, char *, int) = nullptr;
+    int (*showMessageBox)(const char *, const char *, int) = nullptr;
     const void *(*trackFXGUID)(void *, int) = nullptr;
     const void *(*takeFXGUID)(void *, int) = nullptr;
 };
@@ -60,13 +72,20 @@ static int (*regWindow)(const char *, void *) = nullptr;
 static int toggleID = 0, moveID = 0, focusedToggleID = 0, presetToggleID = 0, presetAllToggleID = 0;
 static bool hook1 = false, hook2 = false, toggleHookInstalled = false, automaticHide = true;
 static bool automaticPresetHide = false;
-static int arrangeScrollbarsToggleID = 0;
+static int arrangeScrollbarsToggleID = 0, arrangeProjectEndInsetID = 0;
+constexpr int defaultArrangeEndInset = 8;
+static int arrangeEndInset = defaultArrangeEndInset;
 static bool arrangeScrollbarsHidden = false;
 static __weak NSView *arrangeScrollbarView = nil;
 static bool applyingArrangeScrollbars = false;
+static mx::HookRegistry arrangeScrollbarHooks;
+static bool arrangeViewTimerRegistered = false;
+static bool applyingArrangeEnd = false;
+static int projectLimitEnabledOffset = -1, projectLimitTimeOffset = -1;
 static unsigned long long presetGeneration = 0;
 static const char *kSettingsSection = "mixolve_custom-view";
 static const char *kArrangeScrollbarsKey = "arrange_scrollbars_hidden_v1";
+static const char *kArrangeProjectEndKey = "arrange_project_end_inset_px";
 static const char *kPresetAllKey = "preset_all_hidden_v1";
 static const char *kPresetGenerationKey = "preset_override_generation_v1";
 static __weak NSWindow *movingWindow = nil;
@@ -182,23 +201,32 @@ static NSView *resolveArrangeView() {
         ? control : nil;
 }
 static bool setArrangeScrollbarsVisible(NSView *view, bool visible) {
-    constexpr int bothScrollbars = 3; // SB_BOTH
+    constexpr int horizontalScrollbar = 0, verticalScrollbar = 1;
+    void *hwnd = (__bridge void *)view;
     applyingArrangeScrollbars = true;
-    const bool changed = api.showScrollBar((__bridge void *)view, bothScrollbars, visible) != 0;
+    // CoolSB uses the original window style for each side of SB_BOTH.
+    // Update each side separately so the second call retains the first change.
+    const bool horizontal = api.showScrollBar(hwnd, horizontalScrollbar, visible) != 0;
+    const bool vertical = api.showScrollBar(hwnd, verticalScrollbar, visible) != 0;
     applyingArrangeScrollbars = false;
-    if (changed) [view setNeedsDisplay:YES];
-    return changed;
+    if (horizontal || vertical) [view setNeedsDisplay:YES];
+    return horizontal && vertical;
 }
 static bool arrangeScrollbarsHaveInsets(NSView *view) {
     struct SwellRect { int left, top, right, bottom; };
     using GetRect = void (*)(void *, SwellRect *);
     auto swell = mx::findSwellAPI();
     if (!swell) return false;
+    using GetWindowLong = intptr_t (*)(void *, int);
+    auto getStyle = reinterpret_cast<GetWindowLong>(swell("GetWindowLong"));
+    void *hwnd = (__bridge void *)view;
+    constexpr int styleIndex = -16; // GWL_STYLE
+    constexpr intptr_t scrollbarStyles = 0x00300000; // WS_HSCROLL | WS_VSCROLL
+    if (getStyle && (getStyle(hwnd, styleIndex) & scrollbarStyles)) return true;
     auto getClient = reinterpret_cast<GetRect>(swell("GetClientRect"));
     auto getContent = reinterpret_cast<GetRect>(swell("GetWindowContentViewRect"));
     if (!getClient || !getContent) return false;
     SwellRect client{}, content{};
-    void *hwnd = (__bridge void *)view;
     getClient(hwnd, &client);
     getContent(hwnd, &content);
     return std::abs(client.right - client.left) < std::abs(content.right - content.left) ||
@@ -211,6 +239,170 @@ static void applyArrangeScrollbarSetting() {
         setArrangeScrollbarsVisible(view, false))
         arrangeScrollbarView = view;
 }
+constexpr double arrangePixelTolerance = 1.0;
+
+struct ArrangeEndView {
+    void *project = nullptr;
+    double limit = 0.0, start = 0.0, end = 0.0, zoom = 0.0;
+
+    double width() const { return (end - start) * zoom; }
+    double inset() const { return std::min<double>(arrangeEndInset, width() - 2.0 * arrangePixelTolerance); }
+    double rightEdge() const { return limit + inset() / zoom; }
+    double minimumZoom() const { return (width() - inset()) / limit; }
+};
+
+static bool readArrangeEndView(ArrangeEndView &view) {
+    if (applyingArrangeEnd || projectLimitEnabledOffset < 0 || projectLimitTimeOffset < 0 ||
+        !api.project || !api.projectConfig || !api.arrangeView || !api.horizontalZoom ||
+        !resolveMain().isVisible) return false;
+    view.project = api.project(-1, nullptr, 0);
+    if (!view.project) return false;
+    const auto *enabled = static_cast<const int *>(api.projectConfig(view.project, projectLimitEnabledOffset));
+    if (!enabled || !*enabled) return false;
+    const auto *limit = static_cast<const double *>(api.projectConfig(view.project, projectLimitTimeOffset));
+    if (!limit || !std::isfinite(*limit) || *limit <= 0.0) return false;
+    view.limit = *limit;
+    api.arrangeView(view.project, false, 0, 0, &view.start, &view.end);
+    view.zoom = api.horizontalZoom();
+    return std::isfinite(view.start) && std::isfinite(view.end) && std::isfinite(view.zoom) &&
+           view.zoom > 0.0 && std::isfinite(view.width()) &&
+           view.width() > 2.0 * arrangePixelTolerance;
+}
+
+static void setArrangeEndView(const ArrangeEndView &view, double left, double right) {
+    if (!std::isfinite(left) || !std::isfinite(right) || right <= left) return;
+    applyingArrangeEnd = true;
+    api.arrangeView(view.project, true, 0, 0, &left, &right);
+    // REAPER re-enables CoolSB while updating the horizontal viewport.
+    applyArrangeScrollbarSetting();
+    applyingArrangeEnd = false;
+}
+
+static void clampArrangeProjectEnd() {
+    ArrangeEndView view;
+    if (!readArrangeEndView(view)) return;
+    const double right = view.rightEdge();
+    // REAPER rounds the viewport origin to the timeline's pixel grid.
+    if ((view.end - right) * view.zoom <= arrangePixelTolerance) return;
+    const double left = right - (view.end - view.start);
+    if (left < 0.0) setArrangeEndView(view, 0.0, view.width() / view.minimumZoom());
+    else setArrangeEndView(view, left, right);
+}
+
+static double relativeArrangeDelta(int value, int highValue, int mode) {
+    if (highValue >= 0 || value < 0 || value > 127) return 0.0;
+    int step;
+    switch (mode) {
+        case 1: step = value < 64 ? value : value - 128; break;
+        case 2: step = value - 64; break;
+        case 3: step = value < 64 ? value : 64 - value; break;
+        default: return 0.0;
+    }
+    if (!step || highValue == -1) return step;
+    // REAPER encodes the fractional part of a high-resolution wheel tick in valhw.
+    return step + std::copysign((-1.0 - highValue) / 256.0, static_cast<double>(step));
+}
+
+static bool constrainArrangeNavigation(void *section, int command, int value, int highValue, int mode) {
+    constexpr int zoomWheel = 990, reversedZoomWheel = 979, zoomOut = 1011;
+    constexpr int scrollWheel = 988, reversedScrollWheel = 977, scrollRight = 40141;
+    constexpr int scrollPageWheel = 981, reversedScrollPageWheel = 975;
+    const bool zoomAction = command == zoomOut || command == zoomWheel || command == reversedZoomWheel;
+    if (!zoomAction && command != scrollRight && command != scrollWheel && command != reversedScrollWheel &&
+        command != scrollPageWheel && command != reversedScrollPageWheel) return false;
+    if (section && (!api.actionSection || (section != api.actionSection(0) && section != api.actionSection(100))))
+        return false;
+
+    const double step = relativeArrangeDelta(value, highValue, mode);
+    ArrangeEndView view;
+    if (zoomAction) {
+        // Action 990 receives negative wheel deltas for zoom-out.
+        const double exponent = command == zoomOut ? -1.0 : step * (command == zoomWheel ? 0.1 : -0.1);
+        if (exponent >= 0.0 || !readArrangeEndView(view)) return false;
+        const double minimum = view.minimumZoom();
+        const double distance = (view.zoom - minimum) * view.limit;
+        if (std::abs(distance) <= arrangePixelTolerance) return true;
+        if (view.zoom * std::pow(1.2, exponent) > minimum) return false;
+        // Only handle the step that reaches the boundary. All other steps
+        // keep REAPER's chosen zoom anchor.
+        setArrangeEndView(view, 0.0, view.width() / minimum);
+        return true;
+    }
+
+    const bool reversedScroll = command == reversedScrollWheel || command == reversedScrollPageWheel;
+    const bool towardsRight = command == scrollRight || (reversedScroll ? step < 0.0 : step > 0.0);
+    return towardsRight && readArrangeEndView(view) &&
+           (view.rightEdge() - view.end) * view.zoom <= arrangePixelTolerance;
+}
+
+static bool parseArrangeEndInset(const char *text, int &value) {
+    if (!text) return false;
+    std::string_view input(text);
+    constexpr std::string_view whitespace = " \t\r\n";
+    const auto first = input.find_first_not_of(whitespace);
+    if (first == std::string_view::npos) return false;
+    input = input.substr(first, input.find_last_not_of(whitespace) - first + 1);
+    const auto result = std::from_chars(input.data(), input.data() + input.size(), value);
+    return result.ec == std::errc{} && result.ptr == input.data() + input.size() && value >= 0;
+}
+
+static void promptArrangeEndInset() {
+    constexpr char title[] = "Arrange project end inset";
+    char input[64];
+    std::snprintf(input, sizeof(input), "%d", arrangeEndInset);
+    if (!api.getUserInputs(title, 1, "Pixels from the right edge", input, sizeof(input))) return;
+
+    int requested;
+    if (!parseArrangeEndInset(input, requested)) {
+        if (api.showMessageBox)
+            api.showMessageBox("Enter a whole number of pixels, 0 or greater.", title, 0);
+        return;
+    }
+    if (requested == arrangeEndInset) return;
+
+    ArrangeEndView view;
+    const bool atEdge = readArrangeEndView(view) &&
+        std::abs(view.end - view.rightEdge()) * view.zoom <= arrangePixelTolerance;
+    arrangeEndInset = requested;
+    if (api.setExtState)
+        api.setExtState(kSettingsSection, kArrangeProjectEndKey, std::to_string(requested).c_str(), true);
+    if (atEdge) {
+        const double right = view.rightEdge();
+        const double left = right - (view.end - view.start);
+        if (view.start * view.zoom <= arrangePixelTolerance || left < 0.0)
+            setArrangeEndView(view, 0.0, view.width() / view.minimumZoom());
+        else
+            setArrangeEndView(view, left, right);
+    } else {
+        clampArrangeProjectEnd();
+    }
+}
+
+static void applyArrangeViewSettings() {
+    clampArrangeProjectEnd();
+    applyArrangeScrollbarSetting();
+}
+
+static void keepArrangeScrollbarsHidden(NSView *view) {
+    if (arrangeScrollbarsHidden && !applyingArrangeScrollbars && view == arrangeScrollbarView &&
+        arrangeScrollbarsHaveInsets(view)) setArrangeScrollbarsVisible(view, false);
+}
+
+static void arrangeViewWillDraw(NSView *view, SEL selector) {
+    keepArrangeScrollbarsHidden(view);
+    auto original = reinterpret_cast<void (*)(id, SEL)>(arrangeScrollbarHooks.original(view, selector));
+    original(view, selector);
+}
+
+static intptr_t arrangeSwellMessage(NSView *view, SEL selector, unsigned int message,
+                                    uintptr_t wParam, intptr_t lParam) {
+    constexpr unsigned int nonClientPaint = 0x0085; // WM_NCPAINT
+    if (message == nonClientPaint) keepArrangeScrollbarsHidden(view);
+    auto original = reinterpret_cast<intptr_t (*)(id, SEL, unsigned int, uintptr_t, intptr_t)>(
+        arrangeScrollbarHooks.original(view, selector));
+    return original(view, selector, message, wParam, lParam);
+}
+
 static void toggleArrangeScrollbars() {
     NSView *view = resolveArrangeView();
     if (!view || !setArrangeScrollbarsVisible(view, arrangeScrollbarsHidden)) return;
@@ -1575,6 +1767,7 @@ static void runCommand(int command) {
     else if (command == presetToggleID) toggleFocusedPresetPanel();
     else if (command == presetAllToggleID) toggleAllPresetPanels();
     else if (command == arrangeScrollbarsToggleID) toggleArrangeScrollbars();
+    else if (command == arrangeProjectEndInsetID) promptArrangeEndInset();
 }
 // REAPER can expose multiple command-hook paths. If both report the *same*
 // user action, executing a toggle twice immediately cancels the first call.
@@ -1594,7 +1787,7 @@ static void runWindowCommandOnce(int command) {
     runCommand(command);
 }
 static bool dispatchCommand(int command) {
-    if (!regWindow || command <= 0 || (command != arrangeScrollbarsToggleID && command != toggleID && command != moveID && command != focusedToggleID && command != presetToggleID && command != presetAllToggleID)) return false;
+    if (!regWindow || command <= 0 || (command != arrangeScrollbarsToggleID && command != arrangeProjectEndInsetID && command != toggleID && command != moveID && command != focusedToggleID && command != presetToggleID && command != presetAllToggleID)) return false;
     if ([NSThread isMainThread]) {
         @autoreleasepool { runWindowCommandOnce(command); }
     } else {
@@ -1606,8 +1799,9 @@ static bool dispatchCommand(int command) {
 }
 static bool onCommand(int command, int flag) { (void)flag; return dispatchCommand(command); }
 static bool onCommand2(void *section, int command, int val, int valhw, int relmode, void *hwnd) {
-    (void)section; (void)val; (void)valhw; (void)relmode; (void)hwnd;
-    return dispatchCommand(command);
+    (void)hwnd;
+    return constrainArrangeNavigation(section, command, val, valhw, relmode) ||
+           dispatchCommand(command);
 }
 static void clearObservers() {
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
@@ -1620,8 +1814,14 @@ static void clearObservers() {
 }
 } // namespace
 
-void MixolveRefreshArrangeScrollbarsAfterWheel() {
-    applyArrangeScrollbarSetting();
+bool MixolveIsFXShortcutWindow(NSWindow *window) {
+    if (!regWindow || !window.isVisible || window.isMiniaturized || window.attachedSheet ||
+        NSApp.modalWindow || window == resolveMain()) return false;
+    return isHostFXChainWindow(window) || validFocusedFX(window);
+}
+
+void MixolveRefreshArrangeViewAfterInput() {
+    applyArrangeViewSettings();
 }
 
 extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
@@ -1632,6 +1832,10 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
     api.focused = reinterpret_cast<decltype(api.focused)>(info->get("GetFocusedFX2"));
     api.touchedOrFocused = reinterpret_cast<decltype(api.touchedOrFocused)>(info->get("GetTouchedOrFocusedFX"));
     api.project = reinterpret_cast<decltype(api.project)>(info->get("EnumProjects"));
+    api.projectConfig = reinterpret_cast<decltype(api.projectConfig)>(info->get("projectconfig_var_addr"));
+    api.arrangeView = reinterpret_cast<decltype(api.arrangeView)>(info->get("GetSet_ArrangeView2"));
+    api.horizontalZoom = reinterpret_cast<decltype(api.horizontalZoom)>(info->get("GetHZoomLevel"));
+    api.actionSection = reinterpret_cast<decltype(api.actionSection)>(info->get("SectionFromUniqueID"));
     api.trackCount = reinterpret_cast<decltype(api.trackCount)>(info->get("CountTracks"));
     api.track = reinterpret_cast<decltype(api.track)>(info->get("GetTrack"));
     api.master = reinterpret_cast<decltype(api.master)>(info->get("GetMasterTrack"));
@@ -1647,6 +1851,8 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
     api.refreshToolbar = reinterpret_cast<decltype(api.refreshToolbar)>(info->get("RefreshToolbar2"));
     api.getExtState = reinterpret_cast<decltype(api.getExtState)>(info->get("GetExtState"));
     api.setExtState = reinterpret_cast<decltype(api.setExtState)>(info->get("SetExtState"));
+    api.getUserInputs = reinterpret_cast<decltype(api.getUserInputs)>(info->get("GetUserInputs"));
+    api.showMessageBox = reinterpret_cast<decltype(api.showMessageBox)>(info->get("ShowMessageBox"));
     api.trackFXGUID = reinterpret_cast<decltype(api.trackFXGUID)>(info->get("TrackFX_GetFXGUID"));
     api.takeFXGUID = reinterpret_cast<decltype(api.takeFXGUID)>(info->get("TakeFX_GetFXGUID"));
     mainWindow = fromSwellHandle(info->main);
@@ -1678,10 +1884,39 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
     lastFXChosen = false;
     applicationTerminating = false;
     loadPresetSettings();
-    if (arrangeScrollbarsToggleID && api.getExtState) {
-        const char *value = api.getExtState(kSettingsSection, kArrangeScrollbarsKey);
-        arrangeScrollbarsHidden = value && std::strcmp(value, "1") == 0;
+    if (arrangeScrollbarsToggleID) {
+        if (api.getExtState) {
+            const char *value = api.getExtState(kSettingsSection, kArrangeScrollbarsKey);
+            arrangeScrollbarsHidden = value && std::strcmp(value, "1") == 0;
+        }
+        Class swellView = NSClassFromString(@"REAPERSwell_hwnd");
+        arrangeScrollbarHooks.install(swellView, @selector(viewWillDraw), (IMP)arrangeViewWillDraw);
+        arrangeScrollbarHooks.install(swellView, NSSelectorFromString(@"onSwellMessage:p1:p2:"), (IMP)arrangeSwellMessage);
     }
+    projectLimitEnabledOffset = projectLimitTimeOffset = -1;
+    {
+        auto configOffset = reinterpret_cast<int (*)(const char *, int *)>(info->get("projectconfig_var_getoffs"));
+        if (configOffset && api.projectConfig && api.arrangeView && api.horizontalZoom && api.project) {
+            int enabledSize = 0, timeSize = 0;
+            const int enabled = configOffset("projmaxlenuse", &enabledSize);
+            const int time = configOffset("projmaxlen", &timeSize);
+            if (enabled >= 0 && time >= 0 && enabledSize == sizeof(int) && timeSize == sizeof(double)) {
+                projectLimitEnabledOffset = enabled;
+                projectLimitTimeOffset = time;
+            }
+        }
+    }
+    arrangeEndInset = defaultArrangeEndInset;
+    if (projectLimitEnabledOffset >= 0) {
+        int saved;
+        if (api.getExtState && parseArrangeEndInset(api.getExtState(kSettingsSection, kArrangeProjectEndKey), saved))
+            arrangeEndInset = saved;
+        if (api.getUserInputs)
+            arrangeProjectEndInsetID = std::max(0, regWindow("custom_action", &kArrangeProjectEndInsetAction));
+    }
+    // Script and delayed arrange updates can run without AppKit input.
+    if (arrangeScrollbarsToggleID || projectLimitEnabledOffset >= 0)
+        arrangeViewTimerRegistered = regWindow("timer", (void *)applyArrangeViewSettings) != 0;
     @autoreleasepool {
         NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
         terminateObserver = [center addObserverForName:NSApplicationWillTerminateNotification object:NSApp queue:nil usingBlock:^(__unused NSNotification *note) {
@@ -1744,11 +1979,10 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
             MXPresetPanelSnapshot *preset = findPresetSnapshot(w);
             if (preset) updatePresetViewport(preset);
             rememberMonitoringHeightFromUserResize(w);
-            if (arrangeScrollbarsHidden && w == resolveMain()) applyArrangeScrollbarSetting();
+            if (w == resolveMain()) applyArrangeViewSettings();
         }];
         updateObserver = [center addObserverForName:NSApplicationDidUpdateNotification object:nil queue:nil usingBlock:^(__unused NSNotification *note) {
-            // REAPER can restore the bars when it updates the scroll range.
-            applyArrangeScrollbarSetting();
+            applyArrangeViewSettings();
             // An FX window can receive NSWindowDidBecomeKey before REAPER updates
             // its own focused-FX record. Retry on normal UI updates, not a timer.
             CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -1780,7 +2014,7 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
             }
         }];
         hideAll(); // Main REAPER window now hides immediately on startup.
-        applyArrangeScrollbarSetting();
+        applyArrangeViewSettings();
     }
     return true;
 fail:
@@ -1790,6 +2024,8 @@ fail:
     if (hook2) regWindow("-hookcommand2", reinterpret_cast<void *>(onCommand2));
     if (arrangeScrollbarsToggleID > 0) regWindow("-custom_action", &kArrangeScrollbarsToggle);
     arrangeScrollbarsToggleID = 0;
+    if (arrangeProjectEndInsetID > 0) regWindow("-custom_action", &kArrangeProjectEndInsetAction);
+    arrangeProjectEndInsetID = 0;
     if (presetAllToggleID > 0) regWindow("-custom_action", &kPresetAllToggle);
     if (presetToggleID > 0) regWindow("-custom_action", &kPresetToggle);
     if (focusedToggleID > 0) regWindow("-custom_action", &kFocusedToggle);
@@ -1812,6 +2048,11 @@ extern "C" void MixolveFXWindowsStop() {
         stopMoving();
         const bool shuttingDown = applicationTerminating || (NSApp && !NSApp.isRunning);
         clearObservers();
+        if (arrangeViewTimerRegistered)
+            regWindow("-timer", (void *)applyArrangeViewSettings);
+        arrangeViewTimerRegistered = false;
+        projectLimitEnabledOffset = projectLimitTimeOffset = -1;
+        arrangeScrollbarHooks.uninstall();
         if (shuttingDown) {
             // Do not grow FX windows during REAPER's save/termination sequence.
             releaseAllClosingPresetViewports();
@@ -1841,6 +2082,8 @@ extern "C" void MixolveFXWindowsStop() {
     if (hook2) regWindow("-hookcommand2", reinterpret_cast<void *>(onCommand2));
     if (arrangeScrollbarsToggleID > 0) regWindow("-custom_action", &kArrangeScrollbarsToggle);
     arrangeScrollbarsToggleID = 0;
+    if (arrangeProjectEndInsetID > 0) regWindow("-custom_action", &kArrangeProjectEndInsetAction);
+    arrangeProjectEndInsetID = 0;
     if (presetAllToggleID > 0) regWindow("-custom_action", &kPresetAllToggle);
     if (presetToggleID > 0) regWindow("-custom_action", &kPresetToggle);
     if (focusedToggleID > 0) regWindow("-custom_action", &kFocusedToggle);

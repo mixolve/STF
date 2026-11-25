@@ -657,7 +657,11 @@ void applyTrackVolume(void *p,void *anchor,double target,double factor,mx::Track
  undoBegin(p);
  for(const auto &change:changes)setTrackNumber(change.track,"D_VOL",change.gain);
  undoEnd(p,changes.size()==1?"Set track volume":"Adjust selected track volumes",1);
- dirty(p);adjust(false);arrange();
+ dirty(p);
+ // A gain change only needs repainting. Adjusting the track-list layout
+ // recalculates the arrange scroll ranges and re-enables both scrollbars.
+ [nativeVolumeTCP setNeedsDisplay:YES];
+ arrange();
 }
 bool finishVolume(bool commit){
  if(!volumeField||volumeFinishing)return true;
