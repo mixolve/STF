@@ -2,10 +2,12 @@
 #import <QuartzCore/QuartzCore.h>
 #import <dispatch/dispatch.h>
 #include "model.hpp"
+#include "objc-hooks.hpp"
 #include "track-volume.hpp"
 #include "track-volume-layout.hpp"
 #include <vector>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <cstdio>
 #include <cmath>
@@ -52,6 +54,11 @@ struct MXVolumeItem {
 };
 std::vector<MXVolumeItem> volumeItems;
 void *volumeItemsProject=nullptr;
+int (*swellClassName)(void*,char*,int)=nullptr;
+mx::HookRegistry tcpPaintHooks;
+__weak NSView *nativeVolumeTCP;
+__weak NSWindow *tcpTrackingWindow;
+bool refreshingVolumeReadouts=false;
 __weak NSWindow *volumeWindow;
 __weak NSView *volumeParent;
 NSTextField *volumeField;
@@ -422,11 +429,19 @@ NSRect visibleOnScreen(NSView *view){
  if(!view.window||view.isHiddenOrHasHiddenAncestor)return NSZeroRect;
  return [view.window convertRectToScreen:[view convertRect:view.visibleRect toView:nil]];
 }
+bool isNativeTCP(NSView *view){
+ char name[64]{};
+ return swellClassName&&swellClassName((__bridge void*)view,name,sizeof(name))&&
+        std::string_view(name)=="REAPERTCPDisplay";
+}
 NSView *findTCP(NSView *view,NSRect screen,int depth){
  if(!view||depth>14||!NSContainsRect(visibleOnScreen(view),screen))return nil;
  NSString *cls=NSStringFromClass(view.class);
- if([cls containsString:@"REAPERTCPDisplay"]||[cls containsString:@"TCPReadoutCanvas"])
+ if([cls containsString:@"REAPERTCPDisplay"]||isNativeTCP(view)){
+  nativeVolumeTCP=view;
   return view;
+ }
+ if([cls containsString:@"TCPReadoutCanvas"])return view;
  for(NSView *child in view.subviews){
   if(NSView *tcp=findTCP(child,screen,depth+1))return tcp;
  }
@@ -450,6 +465,9 @@ bool volumeVisibleAtPoint(void *t,NSRect rect){
 // must belong to the TCP's window so the compositor keeps it under the FX.
 NSView *volumeHostForScreenRect(NSRect screen){
  if(NSIsEmptyRect(screen))return nil;
+ NSView *cached=nativeVolumeTCP;
+ if(cached.window.isVisible&&!cached.window.isMiniaturized&&
+    NSContainsRect(visibleOnScreen(cached),screen))return cached;
  id main=mainHwnd?(__bridge id)mainHwnd():nil;
  NSWindow *mainWindow=[main isKindOfClass:NSWindow.class]?main:
                       [main isKindOfClass:NSView.class]?[(NSView*)main window]:nil;
@@ -716,19 +734,7 @@ void beginVolume(void *t,NSView *view){
  if(!w.isKeyWindow&&NSApp.isActive)[w makeKeyWindow];
  if(focusVolumeEditor())volumeDiagnostic("edit: inline field focused",screen);
 }
-void tickVolume(bool afterScroll=false){
- if(volumeField){
-  NSWindow *key=NSApp.keyWindow;
-  if(!positionVolumeEditor()||(afterScroll&&volumeEditorInvisibleTicks)){
-   volumeDiagnostic("edit: track is no longer visible",volumeEditorScreenRect);
-   finishVolume(false);
-  }else if(!NSApp.isActive){
-   if(!finishVolume(true))finishVolume(false);
-  }else if(!key||key==volumeWindow){
-   // Focus changes during SWELL layout do not end the editing session.
-   focusVolumeEditor();
-  }
- }
+void refreshVolumeReadouts(){
  void *p=project(-1,nullptr,0);
  // Track pointers may be reused on project/tab switch. Don't let an old
  // project's overlay briefly paint over a different track with the same ptr.
@@ -772,6 +778,41 @@ void tickVolume(bool afterScroll=false){
   else ++it;
  }
  if(visible)volumeDiagnostic("readouts attached to native TCP window",NSZeroRect);
+}
+
+// Move the layers in the same AppKit update as the host's track rows.
+void syncVolumeReadouts(){
+ if(refreshingVolumeReadouts)return;
+ refreshingVolumeReadouts=true;
+ [CATransaction begin];
+ [CATransaction setDisableActions:YES];
+ refreshVolumeReadouts();
+ [CATransaction commit];
+ refreshingVolumeReadouts=false;
+}
+void drawTCPWhileTracking(NSView *view,SEL selector,NSRect dirty){
+ IMP original=tcpPaintHooks.original(view,selector);
+ if(!original)return;
+ ((void(*)(id,SEL,NSRect))original)(view,selector,dirty);
+ // SWELL can repaint inside its mouse tracking loop without an AppKit
+ // sendEvent: call for each drag. Use the geometry from this native paint.
+ if(host.reg&&view==nativeVolumeTCP&&tcpTrackingWindow&&view.window==tcpTrackingWindow)
+  syncVolumeReadouts();
+}
+void tickVolume(bool afterScroll=false){
+ if(volumeField){
+  NSWindow *key=NSApp.keyWindow;
+  if(!positionVolumeEditor()||(afterScroll&&volumeEditorInvisibleTicks)){
+   volumeDiagnostic("edit: track is no longer visible",volumeEditorScreenRect);
+   finishVolume(false);
+  }else if(!NSApp.isActive){
+   if(!finishVolume(true))finishVolume(false);
+  }else if(!key||key==volumeWindow){
+   // Focus changes during SWELL layout do not end the editing session.
+   focusVolumeEditor();
+  }
+ }
+ syncVolumeReadouts();
 }
 void open(void *t,NSView *view,NSWindow *w){
  if(volumeField&&!finishVolume(true))return;
@@ -967,19 +1008,34 @@ void tick(){
  }
 }
 }
-extern "C" void MixolveUpdateTCPVolumeScroll(NSEvent *event,bool afterScroll){
- if(!host.reg||event.type!=NSEventTypeScrollWheel)return;
+extern "C" void MixolveUpdateTCPVolumeLayout(NSEvent *event,bool afterDispatch){
+ if(!host.reg)return;
  NSWindow *w=event.window;
  if(!w)return;
- auto inWindow=[w](const MXVolumeItem &item){return item.canvas.window==w;};
- if(w!=volumeWindow&&std::none_of(volumeItems.begin(),volumeItems.end(),inWindow))return;
- if(afterScroll){
-  // REAPER has handled this scroll event. Move the overlays before the
-  // next frame instead of waiting for its periodic timer.
-  tickVolume(true);
- }else{
-  for(auto &item:volumeItems)
-   if(inWindow(item))item.canvas.hidden=YES;
+ if(event.type==NSEventTypeScrollWheel){
+  auto inWindow=[w](const MXVolumeItem &item){return item.canvas.window==w;};
+  if(w!=volumeWindow&&std::none_of(volumeItems.begin(),volumeItems.end(),inWindow))return;
+  if(afterDispatch)tickVolume(true);
+  else for(auto &item:volumeItems)if(inWindow(item))item.canvas.hidden=YES;
+  return;
+ }
+ if(!afterDispatch&&event.type==NSEventTypeLeftMouseDown){
+  tcpTrackingWindow=nil;
+  NSPoint point=[w convertPointToScreen:event.locationInWindow];
+  NSView *tcp=volumeHostForScreenRect(NSMakeRect(point.x,point.y,1,1));
+  if(tcp&&tcp==nativeVolumeTCP&&tcp.window==w)tcpTrackingWindow=w;
+  return;
+ }
+ if(!afterDispatch||tcpTrackingWindow!=w)return;
+ switch(event.type){
+  case NSEventTypeLeftMouseDown:
+  case NSEventTypeLeftMouseDragged:
+  case NSEventTypeLeftMouseUp:
+   tickVolume();
+   if(event.type==NSEventTypeLeftMouseUp||!(NSEvent.pressedMouseButtons&1))
+    tcpTrackingWindow=nil;
+   break;
+  default:break;
  }
 }
 extern "C" void MixolveUpdateTCPVolumePointer(NSEvent *event){
@@ -1002,12 +1058,14 @@ extern "C" bool MixolveTrackNameEntry(ep::Info *info){
  if(!info){
   if(host.reg){
    MixolveSetTCPNameMouseFilter(nullptr);host.reg("-timer",(void*)tick);
+   tcpPaintHooks.uninstall();
    finishVolume(false);finish(false);
    hideVolumeOverlay();
    for(auto &item:volumeItems)[item.canvas removeFromSuperview];
    volumeItems.clear();volumeItemsProject=nullptr;
   }
   host={};delegate=nil;volumeDelegate=nil;
+  nativeVolumeTCP=nil;tcpTrackingWindow=nil;swellClassName=nullptr;
   swallowRelease=false;swallowedKey=-1;volumePress={};volumeCaretClick={};volumeSelectionAnchor=NSNotFound;return true;
  }
  if(host.reg)return true;
@@ -1020,5 +1078,8 @@ extern "C" bool MixolveTrackNameEntry(ep::Info *info){
 #undef LOAD
  volumeConfigVar=reinterpret_cast<decltype(volumeConfigVar)>(info->get("get_config_var"));
  if(!info->reg("timer",(void*)tick))return false;
- host=*info;delegate=[MXTCPNameDelegate new];volumeDelegate=[MXTCPVolumeDelegate new];MixolveSetTCPNameMouseFilter(mouseEvent);return true;
+ host=*info;delegate=[MXTCPNameDelegate new];volumeDelegate=[MXTCPVolumeDelegate new];
+ if(auto get=mx::findSwellAPI())swellClassName=(decltype(swellClassName))get("GetClassName");
+ tcpPaintHooks.install(NSClassFromString(@"REAPERSwell_hwnd"),@selector(drawRect:),(IMP)drawTCPWhileTracking);
+ MixolveSetTCPNameMouseFilter(mouseEvent);return true;
 }

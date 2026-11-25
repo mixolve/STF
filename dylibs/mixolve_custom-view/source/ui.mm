@@ -18,7 +18,7 @@
 #include <cstring>
 #include <cctype>
 
-static const char *kMixolveToolbarBuild="mixolve_toolbar_v94_hide_fx_pin";
+static const char *kMixolveToolbarBuild="mixolve_toolbar_v95_tcp_resize";
 // The action ID matches the other REAPER action registrations; the visible
 // name uses the same lowercase mixolve_custom-view prefix.
 struct MXReadoutAction { int section; const char *id; const char *name; };

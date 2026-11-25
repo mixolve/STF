@@ -107,11 +107,7 @@ static void warn_take_layout(void) {
         r_ShowConsoleMsg("mixolve_after-fx: unexpected take order; old takes retained where possible. Review the affected item.\n");
 }
 
-static void run_after_fx(int apply_action) {
-    if (processing) return;
-    ReaProject *project = r_EnumProjects(-1, NULL, 0);
-    if (!project) return;
-
+static void apply_after_fx_to_selection(ReaProject *project, int apply_action, bool own_undo) {
     int count = r_CountSelectedMediaItems(project);
     if (count <= 0) {
         if (r_ShowConsoleMsg)
@@ -144,8 +140,10 @@ static void run_after_fx(int apply_action) {
         return;
     }
 
-    processing = true;
-    r_Undo_BeginBlock2(project);
+    if (own_undo) {
+        processing = true;
+        r_Undo_BeginBlock2(project);
+    }
 
     /* PHASE 1: SELECT TAKE #1. Never delete/switch to take #2 here.
        A previously active second take is also switched to take #1.
@@ -245,11 +243,19 @@ static void run_after_fx(int apply_action) {
     }
 
     select_saved_items(project, states, count);
-    r_Undo_EndBlock2(project, apply_action == ACT_APPLY_FX_MONO
-        ? "mixolve_after-fx: mono" : "mixolve_after-fx: stereo", 4);
-    r_UpdateArrange();
-    processing = false;
+    if (own_undo) {
+        r_Undo_EndBlock2(project, apply_action == ACT_APPLY_FX_MONO
+            ? "mixolve_after-fx: mono" : "mixolve_after-fx: stereo", 4);
+        r_UpdateArrange();
+        processing = false;
+    }
     free(states);
+}
+
+static void run_after_fx(int apply_action) {
+    if (processing) return;
+    ReaProject *project = r_EnumProjects(-1, NULL, 0);
+    if (project) apply_after_fx_to_selection(project, apply_action, true);
 }
 
 #include "fast_render.h"

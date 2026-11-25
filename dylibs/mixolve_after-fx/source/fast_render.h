@@ -183,6 +183,27 @@ static int compare_fast_items(const void *left, const void *right) {
     return (a->start > b->start) - (a->start < b->start);
 }
 
+/* Move single-item ranges to the front in timeline order. An overlapping
+   chain needs separate item renders rather than slices of one mixed WAV. */
+static int partition_overlapping_items(FastItem *items, int count) {
+    int separate = 0;
+    for (int first = 0; first < count;) {
+        int end = first + 1;
+        double range_end = items[first].end;
+        while (end < count && items[end].start < range_end - 1e-9) {
+            range_end = fmax(range_end, items[end].end);
+            ++end;
+        }
+        if (end == first + 1) {
+            FastItem item = items[first];
+            items[first] = items[separate];
+            items[separate++] = item;
+        }
+        first = end;
+    }
+    return separate;
+}
+
 static bool set_fast_item_playback(FastItem *item, bool neutral) {
     bool ok = true;
     for (size_t i = 0; i < sizeof(item->shared) / sizeof(item->shared[0]); ++i) {
@@ -613,10 +634,34 @@ static void run_fast_after_fx(int channels) {
         MediaTrack *track = items[first].track;
         int end = first + 1;
         while (end < count && items[end].track == track) ++end;
+        int overlap_first = first + partition_overlapping_items(items + first, end - first);
         const char *failure;
-        if (!render_fast_track(project, track, items + first, end - first, channels,
+        if (overlap_first > first &&
+            !render_fast_track(project, track, items + first, overlap_first - first, channels,
                                chunk_buffer, &failure))
             report_fast_failure(project, track, failure);
+
+        if (overlap_first < end) {
+            /* A generated stem has an empty first slot, so it still needs a
+               track render. Render these individually before the Apply FX batch. */
+            for (int i = overlap_first; i < end; ++i) {
+                if (!items[i].first &&
+                    !render_fast_track(project, track, &items[i], 1, channels,
+                                       chunk_buffer, &failure))
+                    report_fast_failure(project, track, failure);
+            }
+
+            r_SelectAllMediaItems(project, false);
+            bool has_apply_fx_items = false;
+            for (int i = overlap_first; i < end; ++i) {
+                if (!items[i].first || !is_unlocked(project, items[i].item)) continue;
+                r_SetMediaItemSelected(items[i].item, true);
+                has_apply_fx_items = true;
+            }
+            if (has_apply_fx_items)
+                apply_after_fx_to_selection(project, channels == 1 ? ACT_APPLY_FX_MONO : ACT_APPLY_FX_STEREO,
+                                            false);
+        }
         first = end;
     }
 
