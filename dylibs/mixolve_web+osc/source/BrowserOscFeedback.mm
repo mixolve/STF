@@ -91,7 +91,7 @@ static int parsePort(id obj) {
 }
 
 - (void)sendStateForAction:(int)commandID {
-    if (!gReaper.getToggleState) return;
+    if (commandID <= 0 || !self.enabled || self.socketFD < 0 || !gReaper.getToggleState) return;
     const int state = gReaper.getToggleState(commandID);
     if (state != 0 && state != 1) return;
 

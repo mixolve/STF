@@ -14,6 +14,7 @@
 static reaper_plugin_info_t *sPlugin = nullptr;
 static BrowserController *sBrowser = nil;
 static BrowserOscFeedback *sOsc = nil;
+static int sOscCommandID = 0;
 static int sOpenId = 0;
 static custom_action_register_t sOpenAction = {0, "MIXOLVE_WEB_OSC_OPEN", "mixolve_web+osc: open", nullptr};
 
@@ -39,7 +40,13 @@ static DockActivate sDockActivate = nullptr;
 static GetExtState sGetExtState = nullptr;
 static SetExtState sSetExtState = nullptr;
 
-static void runAction(int id) { if (sRun) sRun(id, 0); }
+static void runAction(int id) {
+    if (!sRun) return;
+    const int previousCommandID = sOscCommandID;
+    sOscCommandID = id;
+    sRun(id, 0);
+    sOscCommandID = previousCommandID;
+}
 static int toggleState(int id) { return sToggle ? sToggle(0, id) : -1; }
 static int namedLookup(const char *name) { return sNamed ? sNamed(name) : 0; }
 static const char *reverseLookup(int id) { return sReverse ? sReverse(id) : nullptr; }
@@ -251,6 +258,12 @@ static bool hookMainCommand(int command, int flag) {
     (void)flag;
     return dispatchCustomAction(command, "hookcommand");
 }
+static void postMainCommand(int command, int) {
+    if (![NSThread isMainThread] || command == sOscCommandID) return;
+    // The OSC request handler sends its own reply, including for no-op requests.
+    [sOsc sendStateForAction:command];
+}
+
 static void unregisterPlugin() {
     webOscTrace("plugin: unloading");
     [sOsc stop]; sOsc = nil;
@@ -258,6 +271,7 @@ static void unregisterPlugin() {
     if (sPlugin && sPlugin->Register) {
         sPlugin->Register("-hookcommand2", reinterpret_cast<void *>(hookCommand));
         sPlugin->Register("-hookcommand", reinterpret_cast<void *>(hookMainCommand));
+        sPlugin->Register("-hookpostcommand", reinterpret_cast<void *>(postMainCommand));
         sPlugin->Register("-custom_action", &sOpenAction);
         sPlugin->Register("-API_CWB_Open", reinterpret_cast<void *>(CWB_Open));
         sPlugin->Register("-APIvararg_CWB_Open", reinterpret_cast<void *>(CWB_Open_vararg));
@@ -316,6 +330,10 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
         }
         if (!rec->Register("hookcommand", reinterpret_cast<void *>(hookMainCommand))) {
             webOscTrace("plugin: hookcommand registration failed");
+            unregisterPlugin(); return 0;
+        }
+        if (!rec->Register("hookpostcommand", reinterpret_cast<void *>(postMainCommand))) {
+            webOscTrace("plugin: hookpostcommand registration failed");
             unregisterPlugin(); return 0;
         }
         rec->Register("API_CWB_Open", reinterpret_cast<void *>(CWB_Open));

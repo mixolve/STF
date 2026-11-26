@@ -18,6 +18,7 @@
 - (instancetype)initWithPath:(NSString *)path;
 - (void)reloadConfig;
 - (void)tick;
+- (void)sendStateForAction:(int)commandID;
 - (void)stop;
 @end
 
