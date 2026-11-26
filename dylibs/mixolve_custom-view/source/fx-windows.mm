@@ -79,6 +79,12 @@ static bool arrangeScrollbarsHidden = false;
 static __weak NSView *arrangeScrollbarView = nil;
 static bool applyingArrangeScrollbars = false;
 static mx::HookRegistry arrangeScrollbarHooks;
+using ArrangeWindowProc = intptr_t (*)(void *, unsigned int, uintptr_t, intptr_t);
+static intptr_t (*arrangeGetWindowLong)(void *, int) = nullptr;
+static intptr_t (*arrangeSetWindowLong)(void *, int, intptr_t) = nullptr;
+static __weak NSView *arrangeSubclassView = nil;
+static ArrangeWindowProc originalArrangeProc = nullptr;
+constexpr int arrangeWndProcIndex = -4; // GWL_WNDPROC
 static bool arrangeViewTimerRegistered = false;
 static bool applyingArrangeEnd = false;
 static int projectLimitEnabledOffset = -1, projectLimitTimeOffset = -1;
@@ -232,12 +238,71 @@ static bool arrangeScrollbarsHaveInsets(NSView *view) {
     return std::abs(client.right - client.left) < std::abs(content.right - content.left) ||
            std::abs(client.bottom - client.top) < std::abs(content.bottom - content.top);
 }
+static intptr_t arrangeScrollbarWindowProc(void *hwnd, unsigned int message,
+                                           uintptr_t wParam, intptr_t lParam) {
+    constexpr unsigned int ncCalcSize = 0x0083, ncHitTest = 0x0084, ncPaint = 0x0085;
+    const bool hide = arrangeScrollbarsHidden && ((__bridge void *)arrangeSubclassView == hwnd);
+    // Arrange has no other non-client decorations. Keep CoolSB's range and
+    // position state, but give the layout the full client area and skip its paint.
+    if (hide && (message == ncCalcSize || message == ncPaint)) return 0;
+    const intptr_t result = originalArrangeProc(hwnd, message, wParam, lParam);
+    constexpr intptr_t horizontalScrollbar = 6, verticalScrollbar = 7, client = 1;
+    if (hide && message == ncHitTest && (result == horizontalScrollbar || result == verticalScrollbar))
+        return client;
+    return result;
+}
+
+static bool arrangeHasScrollbarWindowProc(NSView *view) {
+    return view && view == arrangeSubclassView && arrangeGetWindowLong &&
+        arrangeGetWindowLong((__bridge void *)view, arrangeWndProcIndex) ==
+            reinterpret_cast<intptr_t>(arrangeScrollbarWindowProc);
+}
+
+static void restoreArrangeScrollbarWindowProc() {
+    NSView *view = arrangeSubclassView;
+    if (view && !arrangeHasScrollbarWindowProc(view)) return;
+    if (view)
+        arrangeSetWindowLong((__bridge void *)view, arrangeWndProcIndex, reinterpret_cast<intptr_t>(originalArrangeProc));
+    arrangeSubclassView = nil;
+    originalArrangeProc = nullptr;
+}
+
+static bool installArrangeScrollbarWindowProc(NSView *view) {
+    if (arrangeHasScrollbarWindowProc(view)) return true;
+    restoreArrangeScrollbarWindowProc();
+    if (arrangeSubclassView) return false;
+    if (!arrangeGetWindowLong || !arrangeSetWindowLong) {
+        auto swell = mx::findSwellAPI();
+        if (!swell) return false;
+        arrangeGetWindowLong = reinterpret_cast<decltype(arrangeGetWindowLong)>(swell("GetWindowLong"));
+        arrangeSetWindowLong = reinterpret_cast<decltype(arrangeSetWindowLong)>(swell("SetWindowLong"));
+        if (!arrangeGetWindowLong || !arrangeSetWindowLong) return false;
+    }
+    void *hwnd = (__bridge void *)view;
+    const intptr_t original = arrangeGetWindowLong(hwnd, arrangeWndProcIndex);
+    if (!original) return false;
+    originalArrangeProc = reinterpret_cast<ArrangeWindowProc>(original);
+    arrangeSubclassView = view;
+    arrangeSetWindowLong(hwnd, arrangeWndProcIndex, reinterpret_cast<intptr_t>(arrangeScrollbarWindowProc));
+    if (arrangeHasScrollbarWindowProc(view)) {
+        [view setNeedsDisplay:YES];
+        return true;
+    }
+    arrangeSubclassView = nil;
+    originalArrangeProc = nullptr;
+    return false;
+}
+
 static void applyArrangeScrollbarSetting() {
     if (!arrangeScrollbarsToggleID || !arrangeScrollbarsHidden || applyingArrangeScrollbars) return;
     NSView *view = resolveArrangeView();
-    if (view && (view != arrangeScrollbarView || arrangeScrollbarsHaveInsets(view)) &&
-        setArrangeScrollbarsVisible(view, false))
+    if (!view || arrangeHasScrollbarWindowProc(view)) return;
+    if (view != arrangeScrollbarView) {
+        if (!setArrangeScrollbarsVisible(view, false)) return;
         arrangeScrollbarView = view;
+    }
+    if (!installArrangeScrollbarWindowProc(view) && arrangeScrollbarsHaveInsets(view))
+        setArrangeScrollbarsVisible(view, false);
 }
 constexpr double arrangePixelTolerance = 1.0;
 
@@ -385,7 +450,7 @@ static void applyArrangeViewSettings() {
 
 static void keepArrangeScrollbarsHidden(NSView *view) {
     if (arrangeScrollbarsHidden && !applyingArrangeScrollbars && view == arrangeScrollbarView &&
-        arrangeScrollbarsHaveInsets(view)) setArrangeScrollbarsVisible(view, false);
+        !arrangeHasScrollbarWindowProc(view) && arrangeScrollbarsHaveInsets(view)) setArrangeScrollbarsVisible(view, false);
 }
 
 static void arrangeViewWillDraw(NSView *view, SEL selector) {
@@ -405,9 +470,15 @@ static intptr_t arrangeSwellMessage(NSView *view, SEL selector, unsigned int mes
 
 static void toggleArrangeScrollbars() {
     NSView *view = resolveArrangeView();
-    if (!view || !setArrangeScrollbarsVisible(view, arrangeScrollbarsHidden)) return;
+    if (!view) return;
+    if (arrangeScrollbarsHidden) restoreArrangeScrollbarWindowProc();
+    if (!setArrangeScrollbarsVisible(view, arrangeScrollbarsHidden)) {
+        applyArrangeScrollbarSetting();
+        return;
+    }
     arrangeScrollbarsHidden = !arrangeScrollbarsHidden;
     arrangeScrollbarView = arrangeScrollbarsHidden ? view : nil;
+    if (arrangeScrollbarsHidden) installArrangeScrollbarWindowProc(view);
     if (api.setExtState)
         api.setExtState(kSettingsSection, kArrangeScrollbarsKey,
                         arrangeScrollbarsHidden ? "1" : "0", true);
@@ -2053,6 +2124,7 @@ extern "C" void MixolveFXWindowsStop() {
         arrangeViewTimerRegistered = false;
         projectLimitEnabledOffset = projectLimitTimeOffset = -1;
         arrangeScrollbarHooks.uninstall();
+        restoreArrangeScrollbarWindowProc();
         if (shuttingDown) {
             // Do not grow FX windows during REAPER's save/termination sequence.
             releaseAllClosingPresetViewports();
