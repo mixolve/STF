@@ -6,7 +6,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <uuid/uuid.h>
 
 typedef struct MediaTrack MediaTrack;
 typedef struct PCM_source PCM_source;
@@ -44,11 +43,13 @@ static MediaItem *(*r_AddMediaItemToTrack)(MediaTrack *);
 static bool (*r_DeleteTrackMediaItem)(MediaTrack *, MediaItem *);
 static MediaItem_Take *(*r_AddTakeToMediaItem)(MediaItem *);
 static bool (*r_GetSetMediaItemInfo_String)(MediaItem *, const char *, char *, bool);
-static bool (*r_SetMediaItemTakeInfo_Value)(MediaItem_Take *, const char *, double);
 static bool (*r_GetSetMediaItemTakeInfo_String)(MediaItem_Take *, const char *, char *, bool);
 static bool (*r_GetItemStateChunk)(MediaItem *, char *, int, bool);
 static bool (*r_SetItemStateChunk)(MediaItem *, const char *, bool);
 static bool (*r_SetMediaItemInfo_Value)(MediaItem *, const char *, double);
+static const char *(*r_GetExtState)(const char *, const char *);
+static void (*r_SetExtState)(const char *, const char *, const char *, bool);
+static void (*r_RefreshToolbar2)(int, int);
 
 enum {
     ACT_ADD_EMPTY_TAKE_BEFORE = 41351,
@@ -67,6 +68,19 @@ static custom_action_register_t fast_actions[] = {
     {0, "MIXOLVE_AFTERFX_FAST_MONO", "mixolve_after-fx: fast mono", NULL}
 };
 static int fast_action_ids[2];
+
+static custom_action_register_t track_volume_action = {
+    0, "MIXOLVE_AFTERFX_FAST_INCLUDE_TRACK_VOLUME", "mixolve_after-fx: toggle track volume in fast render", NULL
+};
+static const char fast_settings_section[] = "mixolve_after-fx";
+static const char track_volume_key[] = "fast_include_track_volume";
+static int track_volume_action_id;
+static bool include_track_volume;
+
+static int track_volume_toggle_state(int command) {
+    if (track_volume_action_id <= 0 || command != track_volume_action_id) return -1;
+    return include_track_volume ? 1 : 0;
+}
 
 typedef struct {
     const char *key;
@@ -89,7 +103,7 @@ static int *get_int_project_config(ReaProject *project, const char *key) {
 
 static bool render_fast_wav(ReaProject *project, char *directory, char *name,
                             double start, double end, int bounds, int channels,
-                            const char **failure) {
+                            bool use_track_volume, const char **failure) {
     int *speed_mode = get_int_project_config(project, "projrenderlimit");
     int *speed_cap = get_int_project_config(project, "projrenderspeedcap");
     if (!speed_mode || !speed_cap) {
@@ -98,7 +112,7 @@ static bool render_fast_wav(ReaProject *project, char *directory, char *name,
     }
 
     RenderNumber numbers[] = {
-        {"RENDER_SETTINGS", RENDER_SELECTED_STEMS | RENDER_PRE_FADER, 0},
+        {"RENDER_SETTINGS", RENDER_SELECTED_STEMS | (use_track_volume ? 0 : RENDER_PRE_FADER), 0},
         {"RENDER_BOUNDSFLAG", bounds, 0},
         {"RENDER_STARTPOS", start, 0},
         {"RENDER_ENDPOS", end, 0},
@@ -369,8 +383,8 @@ static bool get_child_item_bounds(ReaProject *project, MediaTrack *folder,
 }
 
 static bool render_fast_track(ReaProject *project, MediaTrack *track, FastItem *items,
-                              int count, int channels, char *chunk_buffer,
-                              const char **failure) {
+                              int count, int channels, bool use_track_volume,
+                              char *chunk_buffer, const char **failure) {
     if (r_GetMediaTrackInfo_Value(track, "B_MUTE")) {
         *failure = "the track is muted";
         return false;
@@ -428,18 +442,24 @@ static bool render_fast_track(ReaProject *project, MediaTrack *track, FastItem *
     r_RecursiveCreateDirectory(media_path, 0);
 
     /* Put renders beside the project's other media so REAPER can clean them up. */
-    uuid_t id;
-    char suffix[37];
-    uuid_generate_random(id);
-    uuid_unparse_lower(id, suffix);
-    char name[sizeof("Mixolve After FX-") + sizeof(suffix) - 1];
-    snprintf(name, sizeof(name), "Mixolve After FX-%s", suffix);
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    char name[] = "mixolve-after-fx-0000000000";
     char path[PATH_MAX];
-    int written = snprintf(path, sizeof(path), "%s/%s.wav", media_path, name);
-    struct stat existing;
-    if (written < 0 || (size_t)written >= sizeof(path) ||
-        lstat(path, &existing) == 0 || errno != ENOENT)
-        return false;
+    bool free_name = false;
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        for (size_t i = sizeof("mixolve-after-fx-") - 1; i < sizeof(name) - 1; ++i)
+            name[i] = alphabet[arc4random_uniform(sizeof(alphabet) - 1)];
+
+        int written = snprintf(path, sizeof(path), "%s/%s.wav", media_path, name);
+        if (written < 0 || (size_t)written >= sizeof(path)) return false;
+        struct stat existing;
+        if (lstat(path, &existing) != 0) {
+            if (errno != ENOENT) return false;
+            free_name = true;
+            break;
+        }
+    }
+    if (!free_name) return false;
 
     *failure = "could not prepare track items";
     int track_item_count = count ? r_CountTrackMediaItems(track) : 0;
@@ -469,12 +489,13 @@ static bool render_fast_track(ReaProject *project, MediaTrack *track, FastItem *
     }
     /* The render action can apply track trim even with pre-fader stems set. */
     const double track_volume = r_GetMediaTrackInfo_Value(track, "D_VOL");
-    const bool override_volume = ready && track_volume != 1.0;
+    const bool override_volume = ready && !use_track_volume && track_volume != 1.0;
     if (override_volume && !r_SetMediaTrackInfo_Value(track, "D_VOL", 1.0)) {
         *failure = "could not set the track fader to unity for rendering";
         ready = false;
     }
-    bool success = ready && render_fast_wav(project, media_path, name, start, end, bounds, channels, failure);
+    bool success = ready && render_fast_wav(project, media_path, name, start, end, bounds,
+                                               channels, use_track_volume, failure);
     if (override_volume &&
         (!r_ValidatePtr2(project, track, "MediaTrack*") ||
          !r_SetMediaTrackInfo_Value(track, "D_VOL", track_volume))) {
@@ -561,6 +582,7 @@ static void run_fast_after_fx(int channels) {
     if (processing) return;
     ReaProject *project = r_EnumProjects(-1, NULL, 0);
     if (!project) return;
+    const bool use_track_volume = include_track_volume;
     const int selected = r_CountSelectedMediaItems(project);
     const int selected_tracks = r_CountSelectedTracks2(project, true);
     const int target_tracks = selected ? 0 : r_CountSelectedTracks2(project, false);
@@ -638,7 +660,7 @@ static void run_fast_after_fx(int channels) {
         const char *failure;
         if (overlap_first > first &&
             !render_fast_track(project, track, items + first, overlap_first - first, channels,
-                               chunk_buffer, &failure))
+                               use_track_volume, chunk_buffer, &failure))
             report_fast_failure(project, track, failure);
 
         if (overlap_first < end) {
@@ -647,7 +669,7 @@ static void run_fast_after_fx(int channels) {
             for (int i = overlap_first; i < end; ++i) {
                 if (!items[i].first &&
                     !render_fast_track(project, track, &items[i], 1, channels,
-                                       chunk_buffer, &failure))
+                                       use_track_volume, chunk_buffer, &failure))
                     report_fast_failure(project, track, failure);
             }
 
@@ -658,9 +680,11 @@ static void run_fast_after_fx(int channels) {
                 r_SetMediaItemSelected(items[i].item, true);
                 has_apply_fx_items = true;
             }
-            if (has_apply_fx_items)
+            if (has_apply_fx_items) {
+                const double gain = use_track_volume ? r_GetMediaTrackInfo_Value(track, "D_VOL") : 1.0;
                 apply_after_fx_to_selection(project, channels == 1 ? ACT_APPLY_FX_MONO : ACT_APPLY_FX_STEREO,
-                                            false);
+                                            false, gain);
+            }
         }
         first = end;
     }
@@ -672,7 +696,7 @@ static void run_fast_after_fx(int channels) {
             r_CountTrackMediaItems(track) != 0)
             continue;
         const char *failure;
-        if (!render_fast_track(project, track, NULL, 0, channels, NULL, &failure))
+        if (!render_fast_track(project, track, NULL, 0, channels, use_track_volume, NULL, &failure))
             report_fast_failure(project, track, failure);
     }
 
@@ -700,6 +724,12 @@ cleanup:
 }
 
 static bool dispatch_fast_action(int command) {
+    if (track_volume_toggle_state(command) >= 0) {
+        include_track_volume = !include_track_volume;
+        r_SetExtState(fast_settings_section, track_volume_key, include_track_volume ? "1" : "0", true);
+        r_RefreshToolbar2(0, command);
+        return true;
+    }
     for (size_t i = 0; i < sizeof(fast_action_ids) / sizeof(fast_action_ids[0]); ++i) {
         if (fast_action_ids[i] > 0 && command == fast_action_ids[i]) {
             run_fast_after_fx(i == 0 ? 2 : 1);
@@ -710,6 +740,11 @@ static bool dispatch_fast_action(int command) {
 }
 
 static void unregister_fast_actions(void) {
+    if (track_volume_action_id > 0) {
+        register_plugin("-toggleaction", (void *)track_volume_toggle_state);
+        register_plugin("-custom_action", (void *)&track_volume_action);
+        track_volume_action_id = 0;
+    }
     for (size_t i = 0; i < sizeof(fast_action_ids) / sizeof(fast_action_ids[0]); ++i) {
         if (fast_action_ids[i] > 0)
             register_plugin("-custom_action", (void *)&fast_actions[i]);
@@ -755,6 +790,7 @@ static void register_fast_actions(reaper_plugin_info_t *info) {
     LOAD_FAST(DeleteTrackMediaItem);
     LOAD_FAST(AddTakeToMediaItem);
     LOAD_FAST(GetSetMediaItemInfo_String);
+    LOAD_FAST(GetMediaItemTakeInfo_Value);
     LOAD_FAST(SetMediaItemTakeInfo_Value);
     LOAD_FAST(GetSetMediaItemTakeInfo_String);
     LOAD_FAST(GetItemStateChunk);
@@ -767,5 +803,19 @@ static void register_fast_actions(reaper_plugin_info_t *info) {
             unregister_fast_actions();
             return;
         }
+    }
+
+    r_GetExtState = (__typeof__(r_GetExtState))info->GetFunc("GetExtState");
+    r_SetExtState = (__typeof__(r_SetExtState))info->GetFunc("SetExtState");
+    r_RefreshToolbar2 = (__typeof__(r_RefreshToolbar2))info->GetFunc("RefreshToolbar2");
+    if (!r_GetExtState || !r_SetExtState || !r_RefreshToolbar2) return;
+
+    const char *setting = r_GetExtState(fast_settings_section, track_volume_key);
+    include_track_volume = setting && strcmp(setting, "1") == 0;
+    track_volume_action_id = register_plugin("custom_action", (void *)&track_volume_action);
+    if (track_volume_action_id > 0 &&
+        !register_plugin("toggleaction", (void *)track_volume_toggle_state)) {
+        register_plugin("-custom_action", (void *)&track_volume_action);
+        track_volume_action_id = 0;
     }
 }

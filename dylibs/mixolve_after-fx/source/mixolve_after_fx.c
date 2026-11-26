@@ -55,6 +55,8 @@ static void (*r_Main_OnCommand)(int, int);
 static MediaItem_Take *(*r_GetTake)(MediaItem *, int);
 static MediaItem_Take *(*r_GetActiveTake)(MediaItem *);
 static void (*r_SetActiveTake)(MediaItem_Take *);
+static double (*r_GetMediaItemTakeInfo_Value)(MediaItem_Take *, const char *);
+static bool (*r_SetMediaItemTakeInfo_Value)(MediaItem_Take *, const char *, double);
 static void (*r_Undo_BeginBlock2)(ReaProject *);
 static void (*r_Undo_EndBlock2)(ReaProject *, const char *, int);
 static void (*r_UpdateArrange)(void);
@@ -107,7 +109,8 @@ static void warn_take_layout(void) {
         r_ShowConsoleMsg("mixolve_after-fx: unexpected take order; old takes retained where possible. Review the affected item.\n");
 }
 
-static void apply_after_fx_to_selection(ReaProject *project, int apply_action, bool own_undo) {
+static void apply_after_fx_to_selection(ReaProject *project, int apply_action,
+                                        bool own_undo, double render_gain) {
     int count = r_CountSelectedMediaItems(project);
     if (count <= 0) {
         if (r_ShowConsoleMsg)
@@ -195,6 +198,12 @@ static void apply_after_fx_to_selection(ReaProject *project, int apply_action, b
                        r_GetTake(s->item, 0) == s->first &&
                        (s->initial_take_count == 1 ||
                         r_GetTake(s->item, 1) == s->old_second));
+        if (s->rendered && render_gain != 1.0) {
+            /* Apply FX renders before track gain. Apply it to the new take
+               before making the old second take eligible for deletion. */
+            double volume = r_GetMediaItemTakeInfo_Value(new_take, "D_VOL");
+            s->rendered = r_SetMediaItemTakeInfo_Value(new_take, "D_VOL", volume * render_gain);
+        }
         if (!s->rendered) {
             if (s->original_active &&
                 r_ValidatePtr2(project, s->original_active, "MediaItem_Take*"))
@@ -255,7 +264,7 @@ static void apply_after_fx_to_selection(ReaProject *project, int apply_action, b
 static void run_after_fx(int apply_action) {
     if (processing) return;
     ReaProject *project = r_EnumProjects(-1, NULL, 0);
-    if (project) apply_after_fx_to_selection(project, apply_action, true);
+    if (project) apply_after_fx_to_selection(project, apply_action, true, 1.0);
 }
 
 #include "fast_render.h"

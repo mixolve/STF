@@ -94,6 +94,32 @@ NSRect labelRect(void *t,const char *key){
  return NSMakeRect(x,y-h,w,h);
 }
 bool contains(NSRect rect,NSPoint point){return rect.size.width>0&&NSPointInRect(point,rect);}
+struct VolumeScrollUndo {
+ void *project=nullptr;
+ void *anchor=nullptr;
+ double deadline=0.0;
+ bool multipleTracks=false;
+};
+VolumeScrollUndo volumeScrollUndo;
+constexpr double volumeScrollUndoInterval=1.0;
+
+void finishVolumeScrollUndo(){
+ if(!volumeScrollUndo.project)return;
+ const auto pending=volumeScrollUndo;
+ volumeScrollUndo={};
+ // A project tab can disappear before the next extension timer tick.
+ for(int i=0;void *openProject=project(i,nullptr,0);++i){
+  if(openProject!=pending.project)continue;
+  undoEnd(openProject,pending.multipleTracks?"Adjust selected track volumes":"Set track volume",1);
+  break;
+ }
+}
+
+bool beforeVolumeScrollCommand(void *,int,int,int,int,void *){
+ finishVolumeScrollUndo();
+ return false;
+}
+
 void finish(bool commit){
  if(!field||finishing)return;
  finishing=true;
@@ -103,6 +129,7 @@ void finish(bool commit){
   char old[65536]{};trackString(track,"P_NAME",old,false);
   // A different rename while editing must not be overwritten by stale input.
   if(initial==old&&name&&initial!=name.UTF8String){
+   finishVolumeScrollUndo();
    undoBegin(owner);trackString(track,"P_NAME",const_cast<char*>(name.UTF8String),true);
    undoEnd(owner,"Rename track",1);dirty(owner);adjust(false);arrange();
   }
@@ -622,7 +649,7 @@ mx::TrackVolumeRange volumeFaderRange(){
  return range.minDb>=-160.0&&range.maxDb<=60.0&&range.minDb<range.maxDb?
      range:mx::TrackVolumeRange{};
 }
-void applyTrackVolume(void *p,void *anchor,double target,double factor,mx::TrackVolumeRange range){
+void applyTrackVolume(void *p,void *anchor,double target,double factor,mx::TrackVolumeRange range,bool scrolling=false){
  struct Change {void *track;double gain;};
  std::vector<Change> gains{{anchor,trackNumber(anchor,"D_VOL")}};
  if(factor!=1.0&&trackNumber(anchor,"I_SELECTED")!=0.0){
@@ -654,9 +681,22 @@ void applyTrackVolume(void *p,void *anchor,double target,double factor,mx::Track
   if(limited!=entry.gain)changes.push_back({entry.track,limited});
  }
  if(changes.empty())return;
- undoBegin(p);
+ const bool multipleTracks=changes.size()>1;
+ if(scrolling){
+  const double now=NSProcessInfo.processInfo.systemUptime;
+  if(volumeScrollUndo.project!=p||volumeScrollUndo.anchor!=anchor||now>=volumeScrollUndo.deadline)
+   finishVolumeScrollUndo();
+  if(!volumeScrollUndo.project){
+   undoBegin(p);
+   volumeScrollUndo={p,anchor,now+volumeScrollUndoInterval,multipleTracks};
+  }
+  volumeScrollUndo.multipleTracks|=multipleTracks;
+ }else{
+  finishVolumeScrollUndo();
+  undoBegin(p);
+ }
  for(const auto &change:changes)setTrackNumber(change.track,"D_VOL",change.gain);
- undoEnd(p,changes.size()==1?"Set track volume":"Adjust selected track volumes",1);
+ if(!scrolling)undoEnd(p,multipleTracks?"Adjust selected track volumes":"Set track volume",1);
  dirty(p);
  // A gain change only needs repainting. Adjusting the track-list layout
  // recalculates the arrange scroll ranges and re-enables both scrollbars.
@@ -880,11 +920,23 @@ bool scrollTrackVolume(NSEvent *event){
  const double delta=std::clamp(vertical*stepDb,-6.0,6.0);
  const double current=trackNumber(anchor,"D_VOL");
  const double factor=mx::volumeGainFromDb(delta);
- applyTrackVolume(p,anchor,current*factor,factor,volumeFaderRange());
+ applyTrackVolume(p,anchor,current*factor,factor,volumeFaderRange(),true);
  return true;
 }
 bool mouseEvent(NSEvent *event){
- if(event.type==NSEventTypeScrollWheel)return scrollTrackVolume(event);
+ switch(event.type){
+  case NSEventTypeScrollWheel:
+   if(scrollTrackVolume(event))return true;
+   finishVolumeScrollUndo();
+   return false;
+  case NSEventTypeLeftMouseDown:
+  case NSEventTypeRightMouseDown:
+  case NSEventTypeOtherMouseDown:
+  case NSEventTypeKeyDown:
+   finishVolumeScrollUndo();
+   break;
+  default:break;
+ }
  if(event.type==NSEventTypeKeyDown&&volumeField){
   if(event.window==volumeWindow||(!event.window&&NSApp.keyWindow==volumeWindow)){
    unsigned short key=event.keyCode;
@@ -991,6 +1043,9 @@ bool mouseEvent(NSEvent *event){
  return false;
 }
 void tick(){
+ if(volumeScrollUndo.project&&
+    (project(-1,nullptr,0)!=volumeScrollUndo.project||
+     NSProcessInfo.processInfo.systemUptime>=volumeScrollUndo.deadline))finishVolumeScrollUndo();
  tickVolume();
  if(field){if(!place())finish(false);return;}
  // Also replace REAPER's native rename field when opened by an action/keyboard.
@@ -1062,6 +1117,8 @@ extern "C" bool MixolveTrackNameEntry(ep::Info *info){
  if(!info){
   if(host.reg){
    MixolveSetTCPNameMouseFilter(nullptr);host.reg("-timer",(void*)tick);
+   host.reg("-hookcommand2",reinterpret_cast<void*>(beforeVolumeScrollCommand));
+   finishVolumeScrollUndo();
    tcpPaintHooks.uninstall();
    finishVolume(false);finish(false);
    hideVolumeOverlay();
@@ -1082,6 +1139,10 @@ extern "C" bool MixolveTrackNameEntry(ep::Info *info){
 #undef LOAD
  volumeConfigVar=reinterpret_cast<decltype(volumeConfigVar)>(info->get("get_config_var"));
  if(!info->reg("timer",(void*)tick))return false;
+ if(!info->reg("<hookcommand2",reinterpret_cast<void*>(beforeVolumeScrollCommand))){
+  info->reg("-timer",(void*)tick);
+  return false;
+ }
  host=*info;delegate=[MXTCPNameDelegate new];volumeDelegate=[MXTCPVolumeDelegate new];
  if(auto get=mx::findSwellAPI())swellClassName=(decltype(swellClassName))get("GetClassName");
  tcpPaintHooks.install(NSClassFromString(@"REAPERSwell_hwnd"),@selector(drawRect:),(IMP)drawTCPWhileTracking);

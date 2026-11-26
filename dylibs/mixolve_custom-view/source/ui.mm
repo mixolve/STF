@@ -18,7 +18,7 @@
 #include <cstring>
 #include <cctype>
 
-static const char *kMixolveToolbarBuild="mixolve_toolbar_v110_item_snap_offset_reset";
+static const char *kMixolveToolbarBuild="mixolve_toolbar_v111_volume_scroll_undo";
 // The action ID matches the other REAPER action registrations; the visible
 // name uses the same lowercase mixolve_custom-view prefix.
 struct MXReadoutAction { int section; const char *id; const char *name; };
