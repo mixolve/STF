@@ -51,7 +51,7 @@ int ReaperPluginEntry(void *module, ep::Info *info) {
         NSString *loadPath = [NSHomeDirectory() stringByAppendingPathComponent:
             @"Library/Logs/mixolve-custom-view-load.log"];
         if (FILE *fp = fopen(loadPath.fileSystemRepresentation, "a")) {
-            fprintf(fp, "v104: loaded=%d tcp=%d toolbar=%d fx=%d take_volume=%d\n",
+            fprintf(fp, "v110: loaded=%d tcp=%d toolbar=%d fx=%d take_volume=%d\n",
                 (int)started, (int)trackNameStarted, (int)envelopeStarted,
                 (int)windowsStarted, (int)takeVolumeStarted);
             fclose(fp);

@@ -33,10 +33,15 @@ Action unityAction = {0, "MIXOLVE_CUSTOMVIEW_TAKE_VOLUME_SET_ZERO_DB",
 Action silenceAction = {0, "MIXOLVE_CUSTOMVIEW_TAKE_VOLUME_SET_NEG_INF",
                         "mixolve_custom-view: set take volume to -inf"};
 
+Action resetSnapOffsetAction = {0, "MIXOLVE_CUSTOMVIEW_ITEM_SNAP_OFFSET_RESET",
+                                "mixolve_custom-view: reset selected items snap offset to zero"};
+
 struct TakeVolumeAPI {
     int (*reg)(const char *, void *) = nullptr;
     int (*countSelectedItems)(void *) = nullptr;
     void *(*selectedItem)(void *, int) = nullptr;
+    double (*getItemValue)(void *, const char *) = nullptr;
+    bool (*setItemValue)(void *, const char *, double) = nullptr;
     void *(*activeTake)(void *) = nullptr;
     bool (*isMIDI)(void *) = nullptr;
     double (*getTakeValue)(void *, const char *) = nullptr;
@@ -56,6 +61,7 @@ int upID = 0;
 int stepID = 0;
 int unityID = 0;
 int silenceID = 0;
+int resetSnapOffsetID = 0;
 double stepDb = defaultStepDb;
 std::string stepText = defaultStepText;
 bool hook1 = false;
@@ -90,8 +96,27 @@ void promptForStep() {
     api.setExtState(stateSection, stepKey, stepText.c_str(), true);
 }
 
+void resetSelectedItemsSnapOffset() {
+    constexpr char property[] = "D_SNAPOFFSET";
+    bool changed = false;
+    const int count = api.countSelectedItems(nullptr);
+    for (int i = 0; i < count; ++i) {
+        void *item = api.selectedItem(nullptr, i);
+        if (!item || api.getItemValue(item, property) == 0.0) continue;
+        if (api.setItemValue(item, property, 0.0)) changed = true;
+    }
+    if (changed) {
+        api.undoItemChange(nullptr, "Reset selected items snap offset to zero");
+        api.updateArrange();
+    }
+}
+
 bool onCommand(int command, int) {
     if (command <= 0) return false;
+    if (command == resetSnapOffsetID) {
+        resetSelectedItemsSnapOffset();
+        return true;
+    }
     if (command == stepID) {
         promptForStep();
         return true;
@@ -131,13 +156,14 @@ void stop() {
     if (!api.reg) return;
     if (hook2) api.reg("-hookcommand2", reinterpret_cast<void *>(onCommand2));
     if (hook1) api.reg("-hookcommand", reinterpret_cast<void *>(onCommand));
+    if (resetSnapOffsetID > 0) api.reg("-custom_action", &resetSnapOffsetAction);
     if (silenceID > 0) api.reg("-custom_action", &silenceAction);
     if (unityID > 0) api.reg("-custom_action", &unityAction);
     if (stepID > 0) api.reg("-custom_action", &stepAction);
     if (upID > 0) api.reg("-custom_action", &upAction);
     if (downID > 0) api.reg("-custom_action", &downAction);
     api = {};
-    silenceID = unityID = stepID = upID = downID = 0;
+    resetSnapOffsetID = silenceID = unityID = stepID = upID = downID = 0;
     stepDb = defaultStepDb;
     stepText = defaultStepText;
     hook1 = hook2 = false;
@@ -155,6 +181,8 @@ extern "C" bool MixolveTakeVolumeEntry(ep::Info *info) {
     loaded.reg = info->reg;
     loaded.countSelectedItems = reinterpret_cast<decltype(loaded.countSelectedItems)>(info->get("CountSelectedMediaItems"));
     loaded.selectedItem = reinterpret_cast<decltype(loaded.selectedItem)>(info->get("GetSelectedMediaItem"));
+    loaded.getItemValue = reinterpret_cast<decltype(loaded.getItemValue)>(info->get("GetMediaItemInfo_Value"));
+    loaded.setItemValue = reinterpret_cast<decltype(loaded.setItemValue)>(info->get("SetMediaItemInfo_Value"));
     loaded.activeTake = reinterpret_cast<decltype(loaded.activeTake)>(info->get("GetActiveTake"));
     loaded.isMIDI = reinterpret_cast<decltype(loaded.isMIDI)>(info->get("TakeIsMIDI"));
     loaded.getTakeValue = reinterpret_cast<decltype(loaded.getTakeValue)>(info->get("GetMediaItemTakeInfo_Value"));
@@ -186,6 +214,8 @@ extern "C" bool MixolveTakeVolumeEntry(ep::Info *info) {
     if (stepID > 0) unityID = api.reg("custom_action", &unityAction);
     if (unityID > 0) silenceID = api.reg("custom_action", &silenceAction);
     if (silenceID > 0) {
+        if (api.getItemValue && api.setItemValue)
+            resetSnapOffsetID = api.reg("custom_action", &resetSnapOffsetAction);
         hook2 = api.reg("hookcommand2", reinterpret_cast<void *>(onCommand2)) != 0;
         if (!hook2) hook1 = api.reg("hookcommand", reinterpret_cast<void *>(onCommand)) != 0;
     }

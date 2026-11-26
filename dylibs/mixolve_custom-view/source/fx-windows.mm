@@ -10,6 +10,10 @@
 #import <ApplicationServices/ApplicationServices.h>
 #include "fx-windows.hpp"
 #include "objc-hooks.hpp"
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach-o/dyld.h>
+#include <libkern/OSCacheControl.h>
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -34,6 +38,11 @@ static MXCustomAction kArrangeScrollbarsToggle = {
 
 static MXCustomAction kArrangeProjectEndInsetAction = {
     0, "MIXOLVE_CUSTOMVIEW_ARRANGE_PROJECT_END_SET_INSET", "mixolve_custom-view: set arrange project end inset"
+};
+
+static MXCustomAction kSnapOffsetHandleToggle = {
+    0, "MIXOLVE_CUSTOMVIEW_ITEM_SNAP_OFFSET_HANDLE_TOGGLE",
+    "mixolve_custom-view: toggle item snap offset handle"
 };
 
 struct MXAPI {
@@ -72,6 +81,11 @@ static int (*regWindow)(const char *, void *) = nullptr;
 static int toggleID = 0, moveID = 0, focusedToggleID = 0, presetToggleID = 0, presetAllToggleID = 0;
 static bool hook1 = false, hook2 = false, toggleHookInstalled = false, automaticHide = true;
 static bool automaticPresetHide = false;
+static int snapOffsetHandleToggleID = 0;
+static bool snapOffsetHandleHidden = false;
+static void (*updateArrange)() = nullptr;
+static const char *kSnapOffsetHandleKey = "item_snap_offset_handle_hidden";
+
 static int arrangeScrollbarsToggleID = 0, arrangeProjectEndInsetID = 0;
 constexpr int defaultArrangeEndInset = 8;
 static int arrangeEndInset = defaultArrangeEndInset;
@@ -218,8 +232,9 @@ static bool setArrangeScrollbarsVisible(NSView *view, bool visible) {
     if (horizontal || vertical) [view setNeedsDisplay:YES];
     return horizontal && vertical;
 }
+struct SwellRect { int left, top, right, bottom; };
+
 static bool arrangeScrollbarsHaveInsets(NSView *view) {
-    struct SwellRect { int left, top, right, bottom; };
     using GetRect = void (*)(void *, SwellRect *);
     auto swell = mx::findSwellAPI();
     if (!swell) return false;
@@ -238,6 +253,9 @@ static bool arrangeScrollbarsHaveInsets(NSView *view) {
     return std::abs(client.right - client.left) < std::abs(content.right - content.left) ||
            std::abs(client.bottom - client.top) < std::abs(content.bottom - content.top);
 }
+static void constrainArrangeMarqueeInput(void *hwnd, unsigned int &message,
+                                         uintptr_t &wParam, intptr_t &lParam);
+
 static intptr_t arrangeScrollbarWindowProc(void *hwnd, unsigned int message,
                                            uintptr_t wParam, intptr_t lParam) {
     constexpr unsigned int ncCalcSize = 0x0083, ncHitTest = 0x0084, ncPaint = 0x0085;
@@ -245,6 +263,9 @@ static intptr_t arrangeScrollbarWindowProc(void *hwnd, unsigned int message,
     // Arrange has no other non-client decorations. Keep CoolSB's range and
     // position state, but give the layout the full client area and skip its paint.
     if (hide && (message == ncCalcSize || message == ncPaint)) return 0;
+    // SWELL_Timer calls the window procedure directly.
+    if ((__bridge void *)arrangeSubclassView == hwnd && projectLimitEnabledOffset >= 0)
+        constrainArrangeMarqueeInput(hwnd, message, wParam, lParam);
     const intptr_t result = originalArrangeProc(hwnd, message, wParam, lParam);
     constexpr intptr_t horizontalScrollbar = 6, verticalScrollbar = 7, client = 1;
     if (hide && message == ncHitTest && (result == horizontalScrollbar || result == verticalScrollbar))
@@ -446,6 +467,9 @@ static void promptArrangeEndInset() {
 static void applyArrangeViewSettings() {
     clampArrangeProjectEnd();
     applyArrangeScrollbarSetting();
+    if (projectLimitEnabledOffset >= 0) {
+        if (NSView *view = resolveArrangeView()) installArrangeScrollbarWindowProc(view);
+    }
 }
 
 static void keepArrangeScrollbarsHidden(NSView *view) {
@@ -454,9 +478,65 @@ static void keepArrangeScrollbarsHidden(NSView *view) {
 }
 
 static void arrangeViewWillDraw(NSView *view, SEL selector) {
+    // Cover viewport changes from scripts and layout updates before painting.
+    // Mouse edge autoscroll is constrained separately at the input boundary.
+    if (projectLimitEnabledOffset >= 0 && view == resolveArrangeView())
+        clampArrangeProjectEnd();
     keepArrangeScrollbarsHidden(view);
     auto original = reinterpret_cast<void (*)(id, SEL)>(arrangeScrollbarHooks.original(view, selector));
     original(view, selector);
+}
+
+// Marquee_MouseMove scrolls horizontally by 1/20 of the client width.
+// Prevent the step at the input boundary, before REAPER scrolls its backing
+// bitmap synchronously. A repaint-time correction cannot undo that frame.
+static void constrainArrangeMarqueeInput(void *hwnd, unsigned int &message,
+                                         uintptr_t &wParam, intptr_t &lParam) {
+    constexpr unsigned int mouseMove = 0x0200, timer = 0x0113;
+    if (message != mouseMove && !(message == timer && wParam == 4)) return;
+    auto swell = mx::findSwellAPI();
+    if (!swell) return;
+    using GetCapture = void *(*)();
+    auto capture = reinterpret_cast<GetCapture>(swell("GetCapture"));
+    if (!capture || capture() != hwnd) return;
+
+    struct Point { int x, y; } point{};
+    if (message == mouseMove) {
+        point = {static_cast<int16_t>(lParam & 0xffff), static_cast<int16_t>((lParam >> 16) & 0xffff)};
+    } else {
+        using GetCursor = void (*)(Point *);
+        using ToClient = void (*)(void *, Point *);
+        auto cursor = reinterpret_cast<GetCursor>(swell("GetCursorPos"));
+        auto toClient = reinterpret_cast<ToClient>(swell("ScreenToClient"));
+        if (!cursor || !toClient) return;
+        cursor(&point);
+        toClient(hwnd, &point);
+    }
+
+    using GetClientRect = void (*)(void *, SwellRect *);
+    auto getClientRect = reinterpret_cast<GetClientRect>(swell("GetClientRect"));
+    if (!getClientRect) return;
+    SwellRect client{};
+    getClientRect(hwnd, &client);
+    if (client.right <= 0 || point.x <= client.right) return;
+
+    ArrangeEndView endView;
+    if (!readArrangeEndView(endView)) return;
+    const double remaining = (endView.rightEdge() - endView.end) * endView.zoom;
+    if (remaining > client.right / 20.0 + arrangePixelTolerance) return;
+    const double right = endView.rightEdge();
+    const double left = right - (endView.end - endView.start);
+    if (left < 0.0) setArrangeEndView(endView, 0.0, endView.width() / endView.minimumZoom());
+    else if (std::abs(remaining) > arrangePixelTolerance) setArrangeEndView(endView, left, right);
+
+    // Keep Y intact so the same event can continue selection and vertical scrolling.
+    if (message == timer) {
+        const NSUInteger buttons = NSEvent.pressedMouseButtons;
+        wParam = ((buttons & 1) ? 1 : 0) | ((buttons & 2) ? 2 : 0);
+        message = mouseMove;
+    }
+    lParam = static_cast<uint16_t>(client.right - 1) |
+        (static_cast<uintptr_t>(static_cast<uint16_t>(point.y)) << 16);
 }
 
 static intptr_t arrangeSwellMessage(NSView *view, SEL selector, unsigned int message,
@@ -478,7 +558,7 @@ static void toggleArrangeScrollbars() {
     }
     arrangeScrollbarsHidden = !arrangeScrollbarsHidden;
     arrangeScrollbarView = arrangeScrollbarsHidden ? view : nil;
-    if (arrangeScrollbarsHidden) installArrangeScrollbarWindowProc(view);
+    if (arrangeScrollbarsHidden || projectLimitEnabledOffset >= 0) installArrangeScrollbarWindowProc(view);
     if (api.setExtState)
         api.setExtState(kSettingsSection, kArrangeScrollbarsKey,
                         arrangeScrollbarsHidden ? "1" : "0", true);
@@ -1815,7 +1895,83 @@ static void toggleChrome() {
     if (api.refreshToolbar && toggleID > 0) api.refreshToolbar(0, toggleID);
     if (api.refreshToolbar && focusedToggleID > 0) api.refreshToolbar(0, focusedToggleID);
 }
+// REAPER 7.86 arm64. The first site publishes the snap-offset hit-test
+// result and the second enters its drawing block. Neither edits item data.
+struct SnapOffsetInstruction {
+    uintptr_t address;
+    uint32_t visible;
+    uint32_t hidden;
+};
+
+static constexpr SnapOffsetInstruction snapOffsetInstructions[] = {
+    {0x1002718b0, 0x5400cc4c, 0xd503201f}, // b.gt -> nop
+    {0x1002c2160, 0x3946cb08, 0x14000094}, // skip snap-offset drawing
+};
+
+static uintptr_t snapOffsetInstructionAddress(const SnapOffsetInstruction &instruction) {
+    return instruction.address + _dyld_get_image_vmaddr_slide(0);
+}
+
+static bool snapOffsetInstructionsMatch(bool hidden) {
+    const mach_header *header = _dyld_get_image_header(0);
+    if (!header || header->cputype != CPU_TYPE_ARM64 || header->filetype != MH_EXECUTE ||
+        ![NSBundle.mainBundle.executablePath.lastPathComponent isEqualToString:@"REAPER"]) return false;
+    for (const auto &instruction : snapOffsetInstructions) {
+        uint32_t actual = 0;
+        mach_vm_size_t size = 0;
+        if (mach_vm_read_overwrite(mach_task_self(), snapOffsetInstructionAddress(instruction),
+                                   sizeof(actual), reinterpret_cast<mach_vm_address_t>(&actual), &size) != KERN_SUCCESS ||
+            size != sizeof(actual) || actual != (hidden ? instruction.hidden : instruction.visible)) return false;
+    }
+    return true;
+}
+
+static bool writeSnapOffsetInstruction(const SnapOffsetInstruction &instruction, bool hidden) {
+    const uintptr_t address = snapOffsetInstructionAddress(instruction);
+    const uintptr_t page = address - address % vm_page_size;
+    const auto task = mach_task_self();
+    if (mach_vm_protect(task, page, vm_page_size, false,
+                        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) return false;
+    auto *code = reinterpret_cast<uint32_t *>(address);
+    const uint32_t previous = *code;
+    *code = hidden ? instruction.hidden : instruction.visible;
+    sys_icache_invalidate(code, sizeof(*code));
+    if (mach_vm_protect(task, page, vm_page_size, false,
+                        VM_PROT_READ | VM_PROT_EXECUTE) == KERN_SUCCESS) return true;
+    *code = previous;
+    sys_icache_invalidate(code, sizeof(*code));
+    mach_vm_protect(task, page, vm_page_size, false, VM_PROT_READ | VM_PROT_EXECUTE);
+    return false;
+}
+
+static bool setSnapOffsetHandleHidden(bool hidden) {
+    if (hidden == snapOffsetHandleHidden) return true;
+    if (!snapOffsetInstructionsMatch(snapOffsetHandleHidden)) return false;
+    if (!writeSnapOffsetInstruction(snapOffsetInstructions[0], hidden)) return false;
+    if (!writeSnapOffsetInstruction(snapOffsetInstructions[1], hidden)) {
+        writeSnapOffsetInstruction(snapOffsetInstructions[0], snapOffsetHandleHidden);
+        return false;
+    }
+    snapOffsetHandleHidden = hidden;
+    if (updateArrange && !applicationTerminating) updateArrange();
+    return true;
+}
+
+static void toggleSnapOffsetHandle() {
+    if (!setSnapOffsetHandleHidden(!snapOffsetHandleHidden)) {
+        if (api.showMessageBox)
+            api.showMessageBox("The item snap offset handle could not be switched in this REAPER build.",
+                               "Item snap offset handle", 0);
+        return;
+    }
+    if (api.setExtState)
+        api.setExtState(kSettingsSection, kSnapOffsetHandleKey, snapOffsetHandleHidden ? "1" : "0", true);
+    if (api.refreshToolbar) api.refreshToolbar(0, snapOffsetHandleToggleID);
+}
+
 static int toggleState(int command) {
+    if (snapOffsetHandleToggleID && command == snapOffsetHandleToggleID)
+        return snapOffsetHandleHidden ? 0 : 1;
     if (arrangeScrollbarsToggleID && command == arrangeScrollbarsToggleID)
         return arrangeScrollbarsHidden ? 1 : 0;
     if (command == toggleID) return automaticHide ? 1 : 0;
@@ -1839,6 +1995,7 @@ static void runCommand(int command) {
     else if (command == presetAllToggleID) toggleAllPresetPanels();
     else if (command == arrangeScrollbarsToggleID) toggleArrangeScrollbars();
     else if (command == arrangeProjectEndInsetID) promptArrangeEndInset();
+    else if (command == snapOffsetHandleToggleID) toggleSnapOffsetHandle();
 }
 // REAPER can expose multiple command-hook paths. If both report the *same*
 // user action, executing a toggle twice immediately cancels the first call.
@@ -1858,7 +2015,7 @@ static void runWindowCommandOnce(int command) {
     runCommand(command);
 }
 static bool dispatchCommand(int command) {
-    if (!regWindow || command <= 0 || (command != arrangeScrollbarsToggleID && command != arrangeProjectEndInsetID && command != toggleID && command != moveID && command != focusedToggleID && command != presetToggleID && command != presetAllToggleID)) return false;
+    if (!regWindow || command <= 0 || (command != snapOffsetHandleToggleID && command != arrangeScrollbarsToggleID && command != arrangeProjectEndInsetID && command != toggleID && command != moveID && command != focusedToggleID && command != presetToggleID && command != presetAllToggleID)) return false;
     if ([NSThread isMainThread]) {
         @autoreleasepool { runWindowCommandOnce(command); }
     } else {
@@ -1944,6 +2101,13 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
     hook1 = regWindow("hookcommand", reinterpret_cast<void *>(onCommand)) != 0;
     if (!hook1 && !hook2) goto fail;
     toggleHookInstalled = regWindow("toggleaction", reinterpret_cast<void *>(toggleState)) != 0;
+    updateArrange = reinterpret_cast<decltype(updateArrange)>(info->get("UpdateArrange"));
+    if (snapOffsetInstructionsMatch(false)) {
+        snapOffsetHandleToggleID = std::max(0, regWindow("custom_action", &kSnapOffsetHandleToggle));
+        const char *saved = api.getExtState ? api.getExtState(kSettingsSection, kSnapOffsetHandleKey) : nullptr;
+        if (snapOffsetHandleToggleID && saved && std::strcmp(saved, "1") == 0)
+            setSnapOffsetHandleHidden(true);
+    }
     savedWindows = [NSMutableArray new];
     chromeOverrides = [NSMapTable weakToStrongObjectsMapTable];
     knownFXWindows = [NSHashTable weakObjectsHashTable];
@@ -1960,9 +2124,6 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
             const char *value = api.getExtState(kSettingsSection, kArrangeScrollbarsKey);
             arrangeScrollbarsHidden = value && std::strcmp(value, "1") == 0;
         }
-        Class swellView = NSClassFromString(@"REAPERSwell_hwnd");
-        arrangeScrollbarHooks.install(swellView, @selector(viewWillDraw), (IMP)arrangeViewWillDraw);
-        arrangeScrollbarHooks.install(swellView, NSSelectorFromString(@"onSwellMessage:p1:p2:"), (IMP)arrangeSwellMessage);
     }
     projectLimitEnabledOffset = projectLimitTimeOffset = -1;
     {
@@ -1984,6 +2145,11 @@ extern "C" bool MixolveFXWindowsStart(ep::Info *info) {
             arrangeEndInset = saved;
         if (api.getUserInputs)
             arrangeProjectEndInsetID = std::max(0, regWindow("custom_action", &kArrangeProjectEndInsetAction));
+    }
+    if (arrangeScrollbarsToggleID || projectLimitEnabledOffset >= 0) {
+        Class swellView = NSClassFromString(@"REAPERSwell_hwnd");
+        arrangeScrollbarHooks.install(swellView, @selector(viewWillDraw), (IMP)arrangeViewWillDraw);
+        arrangeScrollbarHooks.install(swellView, NSSelectorFromString(@"onSwellMessage:p1:p2:"), (IMP)arrangeSwellMessage);
     }
     // Script and delayed arrange updates can run without AppKit input.
     if (arrangeScrollbarsToggleID || projectLimitEnabledOffset >= 0)
@@ -2115,6 +2281,12 @@ fail:
 }
 extern "C" void MixolveFXWindowsStop() {
     if (!regWindow) return;
+    if (snapOffsetHandleToggleID > 0) {
+        setSnapOffsetHandleHidden(false);
+        regWindow("-custom_action", &kSnapOffsetHandleToggle);
+        snapOffsetHandleToggleID = 0;
+    }
+    updateArrange = nullptr;
     @autoreleasepool {
         stopMoving();
         const bool shuttingDown = applicationTerminating || (NSApp && !NSApp.isRunning);
