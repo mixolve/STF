@@ -677,7 +677,8 @@ void applyTrackVolume(void *p,void *anchor,double target,double factor,mx::Track
   const double shifted=entry.gain>0.0?entry.gain*factor:
       entry.track==anchor?target:0.0;
   if(!std::isfinite(entry.gain)||std::isnan(shifted))continue;
-  const double limited=shifted>0.0?std::clamp(shifted,minimum,maximum):0.0;
+  const double limited=shifted>0.0?
+      mx::muteTrackVolumeBelowThreshold(std::clamp(shifted,minimum,maximum)):0.0;
   if(limited!=entry.gain)changes.push_back({entry.track,limited});
  }
  if(changes.empty())return;
@@ -919,8 +920,16 @@ bool scrollTrackVolume(NSEvent *event){
  constexpr double stepDb=0.01;
  const double delta=std::clamp(vertical*stepDb,-6.0,6.0);
  const double current=trackNumber(anchor,"D_VOL");
+ const auto range=volumeFaderRange();
+ if(current==0.0){
+  if(delta>0.0){
+   const double resumeDb=std::max(range.minDb,mx::trackVolumeMuteThresholdDb);
+   applyTrackVolume(p,anchor,mx::volumeGainFromDb(resumeDb+std::max(0.0,delta-stepDb)),1.0,range,true);
+  }
+  return true;
+ }
  const double factor=mx::volumeGainFromDb(delta);
- applyTrackVolume(p,anchor,current*factor,factor,volumeFaderRange(),true);
+ applyTrackVolume(p,anchor,current*factor,factor,range,true);
  return true;
 }
 bool mouseEvent(NSEvent *event){

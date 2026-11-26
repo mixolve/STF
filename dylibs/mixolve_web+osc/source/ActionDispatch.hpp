@@ -3,8 +3,9 @@
 #include "RecoveredReaperCallbacks.hpp"
 
 namespace recovered {
-// Returns true only if an action was actually executed.
+// Returns the accepted action ID, including when the desired state is already set.
+// Returns 0 for an invalid request.
 // This is a C++-only adapter and is testable without REAPER/AppKit.
-bool dispatchAction(const OscActionRequest &request,
-                    const RecoveredReaperCallbacks &callbacks);
+int dispatchAction(const OscActionRequest &request,
+                   const RecoveredReaperCallbacks &callbacks);
 }

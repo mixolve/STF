@@ -22,8 +22,6 @@ using GetToggleState = int (*)(int, int);
 using NamedCommandLookup = int (*)(const char *);
 using ReverseNamedCommandLookup = const char *(*)(int);
 using GetResourcePath = const char *(*)();
-using SectionFromUniqueID = KbdSectionInfo *(*)(int);
-using KbdEnumerateActions = int (*)(KbdSectionInfo *, int, const char **);
 using DockAddEx = void (*)(HWND, const char *, const char *, bool);
 using DockRemove = void (*)(HWND);
 using DockActivate = void (*)(HWND);
@@ -35,8 +33,6 @@ static GetToggleState sToggle = nullptr;
 static NamedCommandLookup sNamed = nullptr;
 static ReverseNamedCommandLookup sReverse = nullptr;
 static GetResourcePath sResource = nullptr;
-static SectionFromUniqueID sSection = nullptr;
-static KbdEnumerateActions sEnumerate = nullptr;
 static DockAddEx sDockAdd = nullptr;
 static DockRemove sDockRemove = nullptr;
 static DockActivate sDockActivate = nullptr;
@@ -53,15 +49,6 @@ static const char *extGet(const char *section, const char *name) {
 }
 static void extSet(const char *section, const char *name, const char *value, bool persistent) {
     if (sSetExtState) sSetExtState(section, name, value, persistent);
-}
-static bool enumerate(size_t index, int *cmd, const char **description) {
-    if (!sSection || !sEnumerate || index >= 100000 || !cmd) return false;
-    KbdSectionInfo *section = sSection(0);
-    if (!section) return false;
-    int result = sEnumerate(section, static_cast<int>(index), description);
-    if (result <= 0) return false;
-    *cmd = result;
-    return true;
 }
 
 // On macOS, a REAPER HWND is a SWELL window handle. It is NOT safe to
@@ -162,8 +149,7 @@ static void dockActivate(void *view) {
     if (sDockActivate) sDockActivate(reinterpret_cast<HWND>(view));
 }
 
-// Initialize OSC after REAPER has loaded the plug-in and the user has opened
-// the browser. This isolates the startup path from periodic command enumeration.
+// Initialize OSC when the user first opens the browser.
 static void startOscWhenReady() {
     if (sOsc || !sResource) return;
     const char *rawPath = resourcePath();
@@ -281,7 +267,7 @@ static void unregisterPlugin() {
     sOpenId = 0;
     installRecoveredReaperCallbacks({});
     sRun = nullptr; sToggle = nullptr; sNamed = nullptr; sReverse = nullptr;
-    sResource = nullptr; sSection = nullptr; sEnumerate = nullptr;
+    sResource = nullptr;
     sDockAdd = nullptr; sDockRemove = nullptr; sDockActivate = nullptr;
     sSwellCreateDialog = nullptr; sSwellDestroyWindow = nullptr; sMainHWND = nullptr;
     sGetExtState = nullptr; sSetExtState = nullptr;
@@ -304,8 +290,6 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
         sNamed = reinterpret_cast<NamedCommandLookup>(get("NamedCommandLookup"));
         sReverse = reinterpret_cast<ReverseNamedCommandLookup>(get("ReverseNamedCommandLookup"));
         sResource = reinterpret_cast<GetResourcePath>(get("GetResourcePath"));
-        sSection = reinterpret_cast<SectionFromUniqueID>(get("SectionFromUniqueID"));
-        sEnumerate = reinterpret_cast<KbdEnumerateActions>(get("kbd_enumerateActions"));
         sDockAdd = reinterpret_cast<DockAddEx>(get("DockWindowAddEx"));
         sDockRemove = reinterpret_cast<DockRemove>(get("DockWindowRemove"));
         sDockActivate = reinterpret_cast<DockActivate>(get("DockWindowActivate"));
@@ -313,7 +297,7 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
         sSetExtState = reinterpret_cast<SetExtState>(get("SetExtState"));
         if (!sRun || !sToggle || !sResource) { webOscTrace("plugin: mandatory API missing"); unregisterPlugin(); return 0; }
         webOscTrace("plugin: REAPER functions resolved");
-        installRecoveredReaperCallbacks({toggleState, runAction, namedLookup, enumerate,
+        installRecoveredReaperCallbacks({toggleState, runAction, namedLookup,
             reverseLookup, dockAdd, dockRemove, dockActivate, createDockHost,
             destroyDockHost, resourcePath, extGet, extSet});
         sOpenId = rec->Register("custom_action", &sOpenAction);
@@ -338,9 +322,7 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
         rec->Register("APIvararg_CWB_Open", reinterpret_cast<void *>(CWB_Open_vararg));
         rec->Register("APIdef_CWB_Open", const_cast<char *>(kApiDescription));
         webOscTrace("plugin: callbacks registered, OSC deferred until browser opens");
-        // For isolation, do not start OSC or enumerate REAPER actions inside
-        // ReaperPluginEntry. An opt-in environment variable enables eager OSC
-        // for experiments (not recommended until crash source is identified).
+        // An opt-in environment variable enables OSC before the browser opens.
         const char *eager = std::getenv("REAPER_WEB_OSC_EAGER_OSC");
         if (eager && std::strcmp(eager, "1") == 0) startOscWhenReady();
         webOscTrace("plugin: entry success");

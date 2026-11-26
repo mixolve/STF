@@ -8,21 +8,15 @@
 @interface BrowserOscFeedback : NSObject
 @property (nonatomic, copy) NSString *path;
 @property (nonatomic, strong) NSData *lastConfig;
-@property (nonatomic, strong) NSArray *watches;
-@property (nonatomic, strong) NSMutableDictionary *states;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic) int socketFD;
 @property (nonatomic) int receiveFD;
 @property (nonatomic) int listenPort;
 @property (nonatomic) struct sockaddr_in destination;
 @property (nonatomic) BOOL enabled;
-@property (nonatomic) BOOL snapshotPending;
 @property (nonatomic) double nextReload;
-@property (nonatomic) double nextSnapshot;
-@property (nonatomic) double nextEnumeration;
 - (instancetype)initWithPath:(NSString *)path;
 - (void)reloadConfig;
-- (void)enumerateActions;
 - (void)tick;
 - (void)stop;
 @end

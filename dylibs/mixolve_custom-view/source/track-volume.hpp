@@ -13,13 +13,18 @@ struct TrackVolumeRange {
     double minDb = -72.0;
     double maxDb = 12.0;
 };
+inline constexpr double trackVolumeMuteThresholdDb = -63.99;
+
 inline double volumeGainFromDb(double db) {
     return std::pow(10.0, db / 20.0);
 }
+inline double muteTrackVolumeBelowThreshold(double linear) {
+    static const double thresholdGain = volumeGainFromDb(trackVolumeMuteThresholdDb - 1e-9);
+    return linear < thresholdGain ? 0.0 : linear;
+}
 inline std::string trackVolumeDisplay(double linear) {
-    if (!(linear > 0.0) || !std::isfinite(linear)) return "MUTED";
+    if (muteTrackVolumeBelowThreshold(linear) == 0.0 || !std::isfinite(linear)) return "MUTED";
     double db = 20.0 * std::log10(linear);
-    if (!std::isfinite(db) || db < -99.99 - 1e-9) return "MUTED";
     // Avoid "-00.00" for a value that rounds to zero.
     if (std::abs(db) < .005) db = 0.0;
     char out[64]{};
@@ -53,9 +58,13 @@ inline bool parseTrackVolume(const std::string &source, double &linear, TrackVol
     if (!(input >> db)) return false;
     char extra = '\0';
     if ((input >> extra) || !input.eof() || !std::isfinite(db)) return false;
+    if (db < trackVolumeMuteThresholdDb) {
+        linear = 0.0;
+        return true;
+    }
     double v = volumeGainFromDb(std::clamp(db, range.minDb, range.maxDb));
     if (!std::isfinite(v) || v <= 0.0) return false;
-    linear = v;
+    linear = muteTrackVolumeBelowThreshold(v);
     return true;
 }
 }

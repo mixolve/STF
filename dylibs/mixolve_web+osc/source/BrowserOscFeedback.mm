@@ -1,20 +1,11 @@
-// FUNCTIONAL REIMPLEMENTATION, NOT THE ORIGINAL OBJECTIVE-C++ SOURCE.
-// Confirmed from binary: class/property/method names, JSON key names,
-// loopback UDP listen socket, nonblocking recv, OSC input/output,
-// action enumeration and polling periods (reload 1s, enumerate 2s).
-// Inferred: some defaults, action filtering, snapshot interval, error policy.
 #import "RecoveredInterfaces.h"
 #import "RecoveredReaperCallbacks.hpp"
 #import "OscCodec.hpp"
 #import "ActionDispatch.hpp"
 #include <arpa/inet.h>
-#include <cerrno>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <algorithm>
-#include <limits>
-#include <cstdlib>
 
 static RecoveredReaperCallbacks gReaper;
 void installRecoveredReaperCallbacks(RecoveredReaperCallbacks callbacks) { gReaper = callbacks; }
@@ -30,8 +21,6 @@ static int parsePort(id obj) {
 - (instancetype)initWithPath:(NSString *)path {
     if ((self = [super init])) {
         _path = [path copy];
-        _states = [NSMutableDictionary dictionary];
-        _watches = @[];
         _receiveFD = -1;
         _socketFD = socket(AF_INET, SOCK_DGRAM, 0);
         _destination = {};
@@ -68,7 +57,6 @@ static int parsePort(id obj) {
     self.lastConfig = raw;
     self.destination = target;
     self.enabled = enable;
-    self.nextEnumeration = 0;
 
     // Only the local loopback interface is exposed, matching the binary.
     if (self.receiveFD != -1 && (!enable || self.listenPort != listenPort)) {
@@ -93,47 +81,28 @@ static int parsePort(id obj) {
         }
     }
     if (!enable) self.listenPort = 0;
-    [self.states removeAllObjects];
-    self.nextSnapshot = 0;
-    self.snapshotPending = YES;
 }
 
-- (void)enumerateActions {
-    // The original enumerates the Main action section, keeping only those
-    // whose toggle state is 0 or 1, and adds a named alias when present.
-    if (!gReaper.enumerateAction || !gReaper.getToggleState) return;
-    NSMutableArray *results = [NSMutableArray array];
-    NSMutableSet *valid = [NSMutableSet set];
-    for (size_t index = 0; index < 100000; ++index) {
-        int commandID = 0;
-        const char *actionDescription = nullptr;
-        if (!gReaper.enumerateAction(index, &commandID, &actionDescription)) break;
-        if (commandID <= 0) continue;
-        const int state = gReaper.getToggleState(commandID);
-        if (state != 0 && state != 1) continue;
-        NSString *numeric = [NSString stringWithFormat:@"/reaper/%d", commandID];
-        if (![valid containsObject:numeric]) {
-            [results addObject:@{@"id": @(commandID), @"address": numeric}];
-            [valid addObject:numeric];
-        }
-        if (gReaper.reverseNamedCommandLookup) {
-            const char *name = gReaper.reverseNamedCommandLookup(commandID);
-            if (name && *name) {
-                NSString *alias = [NSString stringWithUTF8String:name];
-                if (alias.length) {
-                    if (![alias hasPrefix:@"_"]) alias = [@"_" stringByAppendingString:alias];
-                    NSString *address = [@"/reaper/" stringByAppendingString:alias];
-                    if (![valid containsObject:address]) {
-                        [results addObject:@{@"id": @(commandID), @"address": address}];
-                        [valid addObject:address];
-                    }
-                }
-            }
-        }
-    }
-    self.watches = results;
-    for (NSString *key in self.states.allKeys) {
-        if (![valid containsObject:key]) [self.states removeObjectForKey:key];
+- (void)sendState:(int)state toAddress:(const std::string &)address {
+    auto packet = recovered::statePacket(address, state);
+    const struct sockaddr_in destination = self.destination;
+    sendto(self.socketFD, packet.data(), packet.size(), MSG_DONTWAIT,
+           reinterpret_cast<const struct sockaddr *>(&destination), sizeof(destination));
+}
+
+- (void)sendStateForAction:(int)commandID {
+    if (!gReaper.getToggleState) return;
+    const int state = gReaper.getToggleState(commandID);
+    if (state != 0 && state != 1) return;
+
+    [self sendState:state toAddress:"/reaper/" + std::to_string(commandID)];
+    const char *name = gReaper.reverseNamedCommandLookup
+        ? gReaper.reverseNamedCommandLookup(commandID) : nullptr;
+    if (name && *name) {
+        std::string address = "/reaper/";
+        if (*name != '_') address += '_';
+        address += name;
+        [self sendState:state toAddress:address];
     }
 }
 
@@ -154,32 +123,10 @@ static int parsePort(id obj) {
             auto message = recovered::parseOsc(bytes, static_cast<size_t>(n));
             if (!message) continue;
             auto request = recovered::actionRequest(*message);
-            if (request) recovered::dispatchAction(*request, gReaper);
+            if (!request) continue;
+            const int commandID = recovered::dispatchAction(*request, gReaper);
+            if (commandID > 0) [self sendStateForAction:commandID];
         }
-    }
-    if (now >= self.nextEnumeration) {
-        [self enumerateActions];
-        self.nextEnumeration = now + 2.0;
-    }
-    const BOOL snapshot = self.snapshotPending || now >= self.nextSnapshot;
-    if (snapshot) [self.states removeAllObjects];
-    for (NSDictionary *item in self.watches) {
-        NSNumber *commandID = item[@"id"];
-        NSString *address = item[@"address"];
-        if (!commandID || !address || !gReaper.getToggleState) continue;
-        int state = gReaper.getToggleState(commandID.intValue);
-        if (state < 0) continue;
-        NSNumber *cached = self.states[address];
-        if (!snapshot && cached && cached.intValue == state) continue;
-        auto packet = recovered::statePacket(address.UTF8String, state);
-        const struct sockaddr_in dest = self.destination;
-        ssize_t sent = sendto(self.socketFD, packet.data(), packet.size(), 0,
-                              reinterpret_cast<const struct sockaddr *>(&dest), sizeof(dest));
-        if (sent == static_cast<ssize_t>(packet.size())) self.states[address] = @(state);
-    }
-    if (snapshot) {
-        self.nextSnapshot = now + 5.0; // snapshot interval; see binary analysis
-        self.snapshotPending = NO;
     }
 }
 
