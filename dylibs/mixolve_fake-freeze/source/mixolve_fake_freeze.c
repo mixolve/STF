@@ -1,5 +1,5 @@
 /*
-  mixolve_fake-freeze: native REAPER extension, 1.9.1 (macOS)
+  mixolve_fake-freeze: native REAPER extension, 1.9.2 (macOS)
 
   Uses built-in REAPER action 41719 to render a stereo stem track within the
   exact time selection of the source items without
@@ -31,6 +31,7 @@
 #define MFF_ITEM_LOCK_KEY "P_EXT:MFF_FAKE_FREEZE_ORIG_LOCK"
 #define MFF_PREF_SECTION "MelodyneFakeFreeze"
 #define MFF_TAIL_KEY "TailSeconds"
+#define MFF_BYPASS_FIRST_FX_KEY "BypassFirstFX"
 
 /* Dynamically resolved REAPER API. Signatures from the REAPER SDK API docs. */
 static int (*R_CountTracks)(ReaProject *);
@@ -61,6 +62,7 @@ static bool (*R_GetUserInputs)(const char *, int, const char *, char *, int);
 static int (*R_GetProjExtState)(ReaProject *, const char *, const char *, char *, int);
 static int (*R_SetProjExtState)(ReaProject *, const char *, const char *, const char *);
 static void (*R_MarkProjectDirty)(ReaProject *);
+static void (*R_RefreshToolbar2)(int, int);
 static int (*R_TrackFX_GetCount)(MediaTrack *);
 static bool (*R_TrackFX_GetEnabled)(MediaTrack *, int);
 static void (*R_TrackFX_SetEnabled)(MediaTrack *, int, bool);
@@ -72,6 +74,7 @@ static bool (*R_ValidatePtr2)(ReaProject *, void *, const char *);
 static int (*plugin_register_saved)(const char *, void *);
 static int g_toggle_action_id;
 static int g_tail_action_id;
+static int g_bypass_first_fx_action_id;
 static bool g_in_action;
 
 static custom_action_register_t g_toggle_action = {
@@ -81,6 +84,10 @@ static custom_action_register_t g_toggle_action = {
 static custom_action_register_t g_tail_action = {
     0, "MIXOLVE_FAKE_FREEZE_SET_TAIL",
     "mixolve_fake-freeze: set fake freeze tail (seconds) [project]", NULL
+};
+static custom_action_register_t g_bypass_first_fx_action = {
+    0, "MIXOLVE_FAKE_FREEZE_BYPASS_FIRST_FX",
+    "mixolve_fake-freeze: toggle bypass of first FX after fake freeze [project]", NULL
 };
 typedef struct ActionTask {
     char origin_guid[MFF_GUID_SZ];
@@ -134,6 +141,29 @@ static bool read_project_tail(double *seconds) {
     if (exists <= 0) { *seconds = 0.0; return true; }
     input[sizeof(input) - 1] = 0;
     return parse_tail_seconds(input, seconds);
+}
+
+static bool bypass_first_fx_enabled(void) {
+    char value[16] = {0};
+    R_GetProjExtState(NULL, MFF_PREF_SECTION, MFF_BYPASS_FIRST_FX_KEY,
+                      value, (int)sizeof(value));
+    return value[0] != '0' || value[1] != '\0';
+}
+
+static bool run_toggle_bypass_first_fx(void) {
+    if (g_in_action) return true;
+    g_in_action = true;
+    const char *value = bypass_first_fx_enabled() ? "0" : "1";
+    if (R_SetProjExtState(NULL, MFF_PREF_SECTION, MFF_BYPASS_FIRST_FX_KEY, value) <= 0) {
+        R_ShowMessageBox("Could not save the first FX bypass setting.",
+                         "mixolve_fake-freeze", 0);
+    } else {
+        R_MarkProjectDirty(NULL);
+        R_RefreshToolbar2(g_bypass_first_fx_action.uniqueSectionId,
+                          g_bypass_first_fx_action_id);
+    }
+    g_in_action = false;
+    return true;
 }
 
 /* Separate Action List command. No per-render dialogs are ever displayed. */
@@ -590,27 +620,27 @@ static void close_first_fx_window(MediaTrack *src) {
         R_TrackFX_Show(src, 0, 0); /* Hide chain if first FX is shown. */
 }
 
-/* After the stem is rendered, always bypass the first FX without leaving it
-   offline (regardless of plug-in type). All subsequent top-level FX go offline.
-   Original enabled/offline flags are saved in v4 state for exact Unfreeze. */
-static bool deactivate_fx_after_freeze(MediaTrack *src) {
+/* After rendering, optionally bypass the first FX and keep it online.
+   All subsequent top-level FX go offline. */
+static bool deactivate_fx_after_freeze(MediaTrack *src, bool bypass_first_fx) {
     int n = R_TrackFX_GetCount(src);
     if (n < 0) return false;
-    if (n > 0) {
+    if (n > 0 && bypass_first_fx) {
         R_TrackFX_SetOffline(src, 0, false);
         R_TrackFX_SetEnabled(src, 0, false);
     }
     for (int i = 1; i < n; ++i)
         R_TrackFX_SetOffline(src, i, true);
 
-    if (n > 0 && (R_TrackFX_GetOffline(src, 0) ||
-                  R_TrackFX_GetEnabled(src, 0))) return false;
+    if (n > 0 && bypass_first_fx &&
+        (R_TrackFX_GetOffline(src, 0) || R_TrackFX_GetEnabled(src, 0))) return false;
     for (int i = 1; i < n; ++i)
         if (!R_TrackFX_GetOffline(src, i)) return false;
     return true;
 }
 
-static const char *do_freeze(MediaTrack *src, double tail_seconds, MediaTrack **out) {
+static const char *do_freeze(MediaTrack *src, double tail_seconds, bool bypass_first_fx,
+                             MediaTrack **out) {
     char other[MFF_GUID_SZ], guid[MFF_GUID_SZ];
     get_string(src, MFF_STEM_KEY, other, sizeof(other));
     if (other[0]) return "Track is already Fake Frozen.";
@@ -705,7 +735,7 @@ static const char *do_freeze(MediaTrack *src, double tail_seconds, MediaTrack **
     }
 
     /* The renderer may have bypassed FX; restore their enabled state first. */
-    if (!restore_state(src) || !deactivate_fx_after_freeze(src)) {
+    if (!restore_state(src) || !deactivate_fx_after_freeze(src, bypass_first_fx)) {
         set_string(src, MFF_STEM_KEY, "");
         set_string(stem, MFF_SOURCE_KEY, "");
         restore_state(src);
@@ -825,6 +855,7 @@ static bool run_toggle(void) {
         g_in_action = false;
         return true;
     }
+    bool bypass_first_fx = has_freeze && bypass_first_fx_enabled();
 
     int ok_count = 0, error_count = 0;
     char errors[4096] = {0};
@@ -837,7 +868,7 @@ static bool run_toggle(void) {
         if (task->unfreeze) {
             err = do_unfreeze(origin, find_guid(task->stem_guid), &output);
         } else if (valid(origin)) {
-            err = do_freeze(origin, tail_seconds, &output);
+            err = do_freeze(origin, tail_seconds, bypass_first_fx, &output);
         } else {
             err = "Source track no longer exists.";
         }
@@ -870,7 +901,26 @@ static bool hook_command(KbdSectionInfo *section, int command,
     (void)section; (void)val; (void)valhw; (void)relmode; (void)hwnd;
     if (command == g_toggle_action_id) return run_toggle();
     if (command == g_tail_action_id) return run_set_tail();
+    if (command == g_bypass_first_fx_action_id) return run_toggle_bypass_first_fx();
     return false;
+}
+
+static int toggle_action_state(int command) {
+    if (!g_bypass_first_fx_action_id || command != g_bypass_first_fx_action_id) return -1;
+    return bypass_first_fx_enabled();
+}
+
+static void unregister_actions(void) {
+    if (g_bypass_first_fx_action_id > 0)
+        plugin_register_saved("-custom_action", &g_bypass_first_fx_action);
+    if (g_tail_action_id > 0)
+        plugin_register_saved("-custom_action", &g_tail_action);
+    if (g_toggle_action_id > 0)
+        plugin_register_saved("-custom_action", &g_toggle_action);
+    g_bypass_first_fx_action_id = 0;
+    g_tail_action_id = 0;
+    g_toggle_action_id = 0;
+    plugin_register_saved = NULL;
 }
 
 /* macOS REAPER native extension entrypoint. Called with rec==NULL on unload. */
@@ -879,13 +929,10 @@ int ReaperPluginEntry(void *hInstance, reaper_plugin_info_t *rec) {
     (void)hInstance;
     if (!rec) {
         if (plugin_register_saved) {
+            plugin_register_saved("-toggleaction", (void *)toggle_action_state);
             plugin_register_saved("-hookcommand2", (void *)hook_command);
-            plugin_register_saved("-custom_action", (void *)&g_tail_action);
-            plugin_register_saved("-custom_action", (void *)&g_toggle_action);
+            unregister_actions();
         }
-        g_toggle_action_id = 0;
-        g_tail_action_id = 0;
-        plugin_register_saved = NULL;
         return 0;
     }
     if (rec->caller_version != REAPER_PLUGIN_VERSION || !rec->Register || !rec->GetFunc)
@@ -903,6 +950,7 @@ int ReaperPluginEntry(void *hInstance, reaper_plugin_info_t *rec) {
     LOAD(Undo_BeginBlock2); LOAD(Undo_EndBlock2); LOAD(GetTrackColor);
     LOAD(SetTrackColor); LOAD(ShowMessageBox); LOAD(GetUserInputs);
     LOAD(GetProjExtState); LOAD(SetProjExtState); LOAD(MarkProjectDirty);
+    LOAD(RefreshToolbar2);
     LOAD(TrackFX_GetCount);
     LOAD(TrackFX_GetEnabled); LOAD(TrackFX_SetEnabled);
     LOAD(TrackFX_GetOffline); LOAD(TrackFX_SetOffline); LOAD(ValidatePtr2);
@@ -910,20 +958,20 @@ int ReaperPluginEntry(void *hInstance, reaper_plugin_info_t *rec) {
 #undef LOAD
     plugin_register_saved = rec->Register;
     g_toggle_action_id = plugin_register_saved("custom_action", &g_toggle_action);
-    if (g_toggle_action_id <= 0) return 0;
+    if (g_toggle_action_id <= 0) goto fail;
     g_tail_action_id = plugin_register_saved("custom_action", &g_tail_action);
-    if (g_tail_action_id <= 0) {
-        plugin_register_saved("-custom_action", &g_toggle_action);
-        g_toggle_action_id = 0;
-        return 0;
-    }
-    if (!plugin_register_saved("hookcommand2", (void *)hook_command)) {
-        plugin_register_saved("-custom_action", &g_tail_action);
-        plugin_register_saved("-custom_action", &g_toggle_action);
-        g_toggle_action_id = 0;
-        g_tail_action_id = 0;
-        return 0;
+    if (g_tail_action_id <= 0) goto fail;
+    g_bypass_first_fx_action_id = plugin_register_saved("custom_action", &g_bypass_first_fx_action);
+    if (g_bypass_first_fx_action_id <= 0) goto fail;
+    if (!plugin_register_saved("hookcommand2", (void *)hook_command)) goto fail;
+    if (!plugin_register_saved("toggleaction", (void *)toggle_action_state)) {
+        plugin_register_saved("-hookcommand2", (void *)hook_command);
+        goto fail;
     }
     plugin_register_saved("ext_name", (void *)"mixolve_fake-freeze");
     return 1;
+
+fail:
+    unregister_actions();
+    return 0;
 }
