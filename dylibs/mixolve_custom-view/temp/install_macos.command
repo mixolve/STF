@@ -92,13 +92,6 @@ fi
 codesign --force --sign - "$BUILD_DIR/$FILENAME"
 codesign --verify --strict "$BUILD_DIR/$FILENAME"
 
-# Preserve the currently installed binary as a non-loadable backup before
-# replacing an unverified AppKit/UI extension.
-if [[ -f "$DEST_DIR/$FILENAME" ]]; then
-  BACKUP="$DEST_DIR/${FILENAME}.backup-$(date +%Y%m%d-%H%M%S)"
-  cp -p "$DEST_DIR/$FILENAME" "$BACKUP"
-  printf 'Previous version backed up to:\n  %s\n' "$BACKUP"
-fi
 # Update the local build first, then the configured UserPlugins path.
 cp -f "$BUILD_DIR/$FILENAME" "$PROJECT_DIR/$FILENAME"
 cp -f "$BUILD_DIR/$FILENAME" "$DEST_DIR/$FILENAME"
